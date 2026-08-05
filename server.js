@@ -2,7 +2,7 @@ var app = require('express')();
 var http = require('http').Server(app);
 var io = require('socket.io')(http);
 require('./cmd.js');
-var User = require('./user.js');
+var protocol = require('./protocol.js');
 
 var fs = require('fs');
 var path = require('path');
@@ -54,7 +54,7 @@ app.get(/^(?!(\/media\/|\/data\/))/g, function(req, res){
 	res.status(404).end();
 });
 
-io.on('connection', function(socket){ new User(socket) });
+io.on('connection', function(socket){ protocol.handleConnection(socket) });
 
 const port = process.env.PORT || 1423;
 

@@ -42,7 +42,9 @@ function User(socket){
 	}
 	
 	function isHost(){
-		return host.id === socket.id;
+		// `host` is set to undefined when the host disconnects; guard before
+		// dereferencing so a late-joining/relaying socket can't crash the server.
+		return !!host && host.id === socket.id;
 	}
 	
 	socket.on('handshake', function(data){
@@ -52,7 +54,7 @@ function User(socket){
 		if(utilities.checkIfUserExists(name)){
 			socket.emit('handshakeResponse', {failed: "User already exists"});
 		}else{
-			socket.emit('handshakeResponse', {success: true, host: host.id === socket.id, username: name, mapName: 'rookie-harbor.teleporter'});
+			socket.emit('handshakeResponse', {success: true, host: !!host && host.id === socket.id, username: name, mapName: 'rookie-harbor.teleporter'});
 			user = users[name] = sockets[socket.id];
 			user.name = name;
 			onConnect();
@@ -264,6 +266,9 @@ function User(socket){
 		if(!user)
 			return;
 
+		if(!isHost())
+			return;
+
 		if(!entities[data.id]){
 			console.warn("Tried to modify an not existing entity '" + data.id + "'");
 			return;
@@ -289,6 +294,11 @@ function User(socket){
 		if(!user)
 			return;
 
+		// data.id === null means a player reporting their OWN health — any client
+		// may do that. A non-null id is an authoritative enemy, host-only.
+		if (data.id !== null && !isHost())
+			return;
+
 		let id = data.id === null ? user.name : data.id;
 
 		if (data.id !== null) {
@@ -312,6 +322,9 @@ function User(socket){
 	});
 	socket.on('killEntity', function(data){
 		if(!user)
+			return;
+
+		if(!isHost())
 			return;
 
 		if(!entities[data.id]){
