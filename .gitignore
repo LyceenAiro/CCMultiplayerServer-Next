@@ -2,3 +2,6 @@
 node_modules/
 game/
 data/
+_disc_ready
+_disc_result
+server.log

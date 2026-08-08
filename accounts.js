@@ -4,8 +4,9 @@
 const persistence = require('./persistence');
 
 function Accounts() {
-	// username -> socket (live connections only)
-	this.online = {};
+	// username -> socket (live connections only). Null-prototype so reserved keys
+	// (__proto__/constructor/toString) can never be mistaken for a real account.
+	this.online = Object.create(null);
 }
 
 // Returns { account, tookOver, isNew, alreadyOnline }.
@@ -62,19 +63,20 @@ Accounts.prototype.logout = function (username) {
 };
 
 Accounts.prototype.isOnline = function (username) {
-	return !!this.online[username];
+	return Object.prototype.hasOwnProperty.call(this.online, username);
 };
 
 Accounts.prototype.getSocket = function (username) {
-	return this.online[username];
+	return Object.prototype.hasOwnProperty.call(this.online, username) ? this.online[username] : undefined;
 };
 
 Accounts.prototype.exists = function (username) {
-	return !!persistence.db.accounts[username];
+	return Object.prototype.hasOwnProperty.call(persistence.db.accounts, username);
 };
 
 Accounts.prototype.getAccount = function (username) {
-	return persistence.db.accounts[username];
+	return Object.prototype.hasOwnProperty.call(persistence.db.accounts, username)
+		? persistence.db.accounts[username] : undefined;
 };
 
 Accounts.prototype.onlineNames = function () {

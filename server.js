@@ -3,9 +3,19 @@ var http = require('http').Server(app);
 var io = require('socket.io')(http);
 require('./cmd.js');
 var protocol = require('./protocol.js');
+var config = require('./config');
 
 var fs = require('fs');
 var path = require('path');
+
+// A malformed/buggy client message must never take the whole server down. Log
+// and keep going instead of letting an uncaughtException kill the process.
+process.on('uncaughtException', function (err) {
+	console.error('[server] uncaughtException (kept alive):', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', function (err) {
+	console.error('[server] unhandledRejection (kept alive):', err && err.stack ? err.stack : err);
+});
 
 
 /*app.get(/^\/data\/maps/, function(req, res){
@@ -59,5 +69,7 @@ io.on('connection', function(socket){ protocol.handleConnection(socket) });
 const port = process.env.PORT || 1423;
 
 http.listen(port, function(){
-	console.log('listening on *:' + port);
+	// Round 17: log the server version at boot so a version mismatch with a
+	// connecting client is obvious from the console before the handshake gate.
+	console.log('[server] multiplayer server v' + config.version + ' listening on *:' + port);
 });

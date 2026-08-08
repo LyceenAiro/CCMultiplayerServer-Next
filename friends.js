@@ -31,6 +31,7 @@ function outgoingArr(a) {
 function migrate(username) {
     const me = acc(username);
     if (!me) return;
+    let changed = false;
     const fr = friendArr(me);
     for (let i = fr.length - 1; i >= 0; i--) {
         const other = fr[i];
@@ -38,16 +39,20 @@ function migrate(username) {
         const mutual = them && friendArr(them).includes(username);
         if (!mutual) {
             fr.splice(i, 1);
+            changed = true;
             // If the other side has a pending incoming from me, keep it; else this
             // becomes my outgoing request toward them.
             if (them && incomingArr(them).includes(username)) {
-                if (!outgoingArr(me).includes(other)) outgoingArr(me).push(other);
+                if (!outgoingArr(me).includes(other)) { outgoingArr(me).push(other); changed = true; }
             } else if (them) {
-                if (!incomingArr(them).includes(username)) incomingArr(them).push(username);
-                if (!outgoingArr(me).includes(other)) outgoingArr(me).push(other);
+                if (!incomingArr(them).includes(username)) { incomingArr(them).push(username); changed = true; }
+                if (!outgoingArr(me).includes(other)) { outgoingArr(me).push(other); changed = true; }
             }
         }
     }
+    // migrate() mutates the in-memory db; without this the cleanup was never
+    // flushed, so the asymmetric edges reappeared on the next server restart.
+    if (changed) persistence.save();
 }
 
 // Confirmed (mutual) friends with online flags.
@@ -95,16 +100,22 @@ Friends.prototype.request = function (username, targetName) {
 };
 
 // Accept an incoming request from `fromName`. Makes the friendship mutual.
+// Only succeeds if there actually IS a pending incoming request — otherwise a
+// client could forge a friendship (or re-accept after declining).
 Friends.prototype.accept = function (username, fromName) {
     const me = acc(username);
     const them = acc(fromName);
     if (!me) return { ok: false, error: 'No account' };
+    if (!them) return { ok: false, error: 'No such player: ' + fromName };
+    if (!incomingArr(me).includes(fromName)) {
+        return { ok: false, error: 'No pending request from: ' + fromName };
+    }
     // Clear the pending markers on both sides.
     me.incoming = incomingArr(me).filter((n) => n !== fromName);
-    if (them) them.outgoing = outgoingArr(them).filter((n) => n !== username);
+    them.outgoing = outgoingArr(them).filter((n) => n !== username);
     // Make it mutual.
     if (!friendArr(me).includes(fromName)) friendArr(me).push(fromName);
-    if (them && !friendArr(them).includes(username)) friendArr(them).push(username);
+    if (!friendArr(them).includes(username)) friendArr(them).push(username);
     persistence.save();
     return { ok: true };
 };

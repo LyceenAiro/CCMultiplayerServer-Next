@@ -1,0 +1,4 @@
+{
+	"_comment": "monsterHpPerPlayer = extra max-HP fraction added to monsters per ADDITIONAL party member (0.5 = +50% HP per extra player; a 3-player party faces enemies at x2.0 HP). Clients receive this value as `hpScale` in the handshakeResponse and apply it using their own party roster size. Loaded at startup by config.js; a missing/broken file falls back to 0.5.",
+	"monsterHpPerPlayer": 0.5
+}
