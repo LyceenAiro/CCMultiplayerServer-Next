@@ -16,6 +16,10 @@
 //   saveDownloadKbS     per-socket save-DOWNLOAD pacing in kb/s (the login save is
 //                       streamed as 8192-char saveDownload parts at this rate).
 //                       Range [1, 10240]; default 200.
+//   port                TCP port the server listens on. Range [1, 65535]; default
+//                       15151. The process.env.PORT environment variable, when set,
+//                       overrides this (handy for a quick one-off launch without
+//                       editing config.json).
 const fs = require('fs');
 const path = require('path');
 
@@ -25,12 +29,13 @@ const DEFAULTS = {
 	monsterHpPerPlayer: 0.5,
 	saveUploadKbS: 1024,
 	saveDownloadKbS: 200,
+	port: 15151,
 };
 
 // Round 17: mod version. The server rejects any client whose mod version differs
 // (handshake gate in protocol.js). Bump this TOGETHER with the client mod version
 // (client src/multiplayer.ts MP_VERSION + package.json "version") on every release.
-const MOD_VERSION = '1.53.0';
+const MOD_VERSION = '1.54.0';
 
 function loadConfig() {
 	const cfg = Object.assign({}, DEFAULTS);
@@ -56,6 +61,10 @@ function loadConfig() {
 	};
 	cfg.saveUploadKbS = clampKbS('saveUploadKbS', DEFAULTS.saveUploadKbS);
 	cfg.saveDownloadKbS = clampKbS('saveDownloadKbS', DEFAULTS.saveDownloadKbS);
+	// Clamp the listen port to a valid TCP range so a config typo can't produce an
+	// invalid port that would crash http.listen at boot.
+	const p = Number(cfg.port);
+	cfg.port = (isFinite(p) && p >= 1 && p <= 65535) ? Math.floor(p) : DEFAULTS.port;
 	return cfg;
 }
 
@@ -68,6 +77,7 @@ console.log('[config] multiplayer mod v' + config.version +
 	' | monsterHpPerPlayer = ' + config.monsterHpPerPlayer +
 	' (monsters gain +' + (config.monsterHpPerPlayer * 100) + '% max HP per extra party member)' +
 	' | saveUploadKbS = ' + config.saveUploadKbS +
-	' | saveDownloadKbS = ' + config.saveDownloadKbS);
+	' | saveDownloadKbS = ' + config.saveDownloadKbS +
+	' | port = ' + config.port);
 
 module.exports = config;

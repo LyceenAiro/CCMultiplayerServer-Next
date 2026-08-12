@@ -832,6 +832,10 @@ function handleConnection(socket) {
 	// spectating heard nothing. The host relays a cosmetic-only notice (NO damage here — HP
 	// already moved via enemyDamage) so every other member replays the enemy's hurt FX on its
 	// own puppet. Host-only (broadcastHostState), field-whitelisted, cosmetic only.
+	// ROUND 58: pass through the `attacker` the host stamped on this packet (the member who
+	// landed the hit). That attacking member is NOT self-dropped here (it isn't the host), so
+	// it also receives this broadcast — its client skips the replay on an attacker match to
+	// avoid hearing its own hurt sound twice. Validated to a bounded string, never trusted.
 	socket.on('enemyHurt', function (data) {
 		if (dropIfNotAuthed('enemyHurt')) return;
 		if (rateLimited('enemyHurt', 50)) return;
@@ -840,9 +844,11 @@ function handleConnection(socket) {
 		if (!isFinite(type) || type < 0 || type > 5) type = 2;
 		let attackElement = Number(data.attackElement);
 		if (!isFinite(attackElement) || attackElement < 0 || attackElement > 4) attackElement = 0;
+		const attacker = (typeof data.attacker === 'string' && data.attacker && data.attacker.length <= 64) ? data.attacker : undefined;
 		world.broadcastHostState(ctx, username, 'enemyHurt', {
 			uid: data.uid, type: Math.round(type),
 			attackElement: Math.round(attackElement), critical: data.critical === true,
+			...(attacker !== undefined ? { attacker } : {}),
 		});
 	});
 

@@ -66,7 +66,10 @@ app.get(/^(?!(\/media\/|\/data\/))/g, function(req, res){
 
 io.on('connection', function(socket){ protocol.handleConnection(socket) });
 
-const port = process.env.PORT || 1423;
+// Port resolution order: process.env.PORT (one-off override) > config.json `port`
+// > the built-in default (15151, set in config.js). config.port is always a valid
+// clamped number, so this never falls back to the old 1423.
+const port = process.env.PORT || config.port;
 
 http.listen(port, function(){
 	// Round 17: log the server version at boot so a version mismatch with a
