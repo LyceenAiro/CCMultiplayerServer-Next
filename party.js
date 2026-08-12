@@ -2,6 +2,13 @@
 // in at most one party; leader leaves -> leadership transfers; empty party
 // disbands. Parties exist so that PATH/DUNGEON maps can be shared by exactly
 // the party members (world.js keys those instances by partyId).
+
+// Round 23 review: server-side invite TTL (backstop). The CLIENT auto-declines a
+// pending invite after 20s; if the player never answers (disconnect/afk), the
+// invite must not pin the busy-check forever, so hasPendingInvite lazily prunes
+// entries older than this. 60s > 20s so the client's own decline wins normally.
+const INVITE_TTL_MS = 60000;
+
 function Party() {
 	// Null-prototype maps so reserved keys can't collide with party/user data.
 	// partyId -> { id, leader, members: [username] }
@@ -21,10 +28,12 @@ Party.prototype.getParty = function (partyId) {
 	return this.parties[partyId];
 };
 
-// Record that `username` was invited to `partyId`.
+// Record that `username` was invited to `partyId`. The invite carries a stamp so
+// hasPendingInvite can prune it after INVITE_TTL_MS (a stale invite can't block
+// future invites).
 Party.prototype.addInvite = function (partyId, username) {
 	if (!this.pendingInvites[username]) this.pendingInvites[username] = Object.create(null);
-	this.pendingInvites[username][partyId] = true;
+	this.pendingInvites[username][partyId] = { t: Date.now() };
 };
 
 // True (and consumes the invite) if `username` was actually invited to `partyId`.
@@ -42,6 +51,26 @@ Party.prototype.consumeInvite = function (partyId, username) {
 // Drop all pending invites for a user (on logout).
 Party.prototype.clearInvites = function (username) {
 	delete this.pendingInvites[username];
+};
+
+// Round 23 wave 3: true when `username` has any pending invite outstanding (the
+// partyInvite busy-check — a player already looking at an invite popup must not
+// be invited again, their accept/decline would race). Lazily prunes invites
+// older than INVITE_TTL_MS so a stale invite can't pin the busy-check forever.
+Party.prototype.hasPendingInvite = function (username) {
+	const set = this.pendingInvites[username];
+	if (!set) return false;
+	const now = Date.now();
+	for (const id of Object.keys(set)) {
+		if (now - (set[id].t || 0) > INVITE_TTL_MS) {
+			delete set[id]; // expired — drop it (|0 defends any legacy `true` value)
+		}
+	}
+	if (Object.keys(set).length === 0) {
+		delete this.pendingInvites[username];
+		return false;
+	}
+	return true;
 };
 
 // Drop every pending invite that points at `partyId` (called when that party

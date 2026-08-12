@@ -144,11 +144,23 @@ World.prototype.changeMap = function (ctx, username, mapName, areaType, pos) {
 	}
 
 	// First one in becomes the host of this instance.
-	let isHost = false;
-	if (!inst.host || !ctx.isOnline(inst.host)) {
-		inst.host = username;
-		isHost = true;
-	}
+	const isHost = !inst.host || !ctx.isOnline(inst.host);
+	if (isHost) inst.host = username;
+
+	// Round 35 (void-creature): a party member who crosses a map exit FIRST becomes the
+	// lone host of the fresh `party:<pid>:<map>` instance. Round-35's first fix told that
+	// crosser to force-strip its local enemies (mpForceStripNextLoad) and wait for the
+	// leader's relay — but that left the whole map EMPTY whenever the leader didn't
+	// immediately follow, which is wrong: whether a room has monsters should depend ONLY
+	// on whether you're the host of that room's instance, never on the leader.
+	//
+	// The engine is a strict teleport-and-replace (clearMap kills every entity incl. the
+	// player, then loadLevel rebuilds the new map fresh) — there is NO adjacent-map
+	// streaming and no window where the member and leader share two maps. So the first
+	// crosser is the SOLE occupant of the new instance and its locally-spawned enemies
+	// are the authoritative set, relayed to teammates when they cross in. We therefore
+	// do NOT force-strip here anymore: the crosser keeps host and spawns its own
+	// authoritative enemies. No mpForceStripNextLoad is emitted.
 
 	// Notify existing members that this player entered, and vice versa.
 	const members = [];
@@ -182,8 +194,10 @@ World.prototype.changeMap = function (ctx, username, mapName, areaType, pos) {
 		}
 	}
 	// Round 11: replay the host's party-bot roster so late joiners see the bots.
+	// Round 27 (item 2): carry the cached per-bot maps so the off-map HUD hide/grey
+	// works for a late joiner too (botMaps is set by the same broadcast that cached bots).
 	if (!isHost && inst.bots && inst.bots.length) {
-		ctx.getSocket(username).emit('partyBots', { bots: inst.bots });
+		ctx.getSocket(username).emit('partyBots', { bots: inst.bots, maps: inst.botMaps || {} });
 	}
 
 	// Round 20: push the party's opened-chest snapshot for the JOINED map (filtered

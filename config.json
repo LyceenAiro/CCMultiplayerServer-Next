@@ -1,4 +1,6 @@
 {
-	"_comment": "monsterHpPerPlayer = extra max-HP fraction added to monsters per ADDITIONAL party member (0.5 = +50% HP per extra player; a 3-player party faces enemies at x2.0 HP). Clients receive this value as `hpScale` in the handshakeResponse and apply it using their own party roster size. Loaded at startup by config.js; a missing/broken file falls back to 0.5.",
-	"monsterHpPerPlayer": 0.5
+	"_comment": "monsterHpPerPlayer = extra max-HP fraction added to monsters per ADDITIONAL party member (0.5 = +50% HP per extra player; a 3-player party faces enemies at x2.0 HP). Clients receive this value as `hpScale` in the handshakeResponse and apply it using their own party roster size. Loaded at startup by config.js; a missing/broken file falls back to 0.5.\nsaveUploadKbS = per-socket save-UPLOAD bandwidth cap in kb/s (saveChunk token bucket; the client paces itself at ~512 kb/s, well under this). Range [1, 10240]; default 1024.\nsaveDownloadKbS = per-socket save-DOWNLOAD pacing in kb/s (the login save is streamed as 8192-char saveDownload parts at this rate). Range [1, 10240]; default 200.",
+	"monsterHpPerPlayer": 0.5,
+	"saveUploadKbS": 1024,
+	"saveDownloadKbS": 200
 }

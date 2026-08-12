@@ -6,6 +6,7 @@
 // the side that never had the edge — fixes "A sees B but B doesn't see A".
 const persistence = require('./persistence');
 const accounts = require('./accounts');
+const bots = require('./bots');
 
 function Friends() {}
 
@@ -63,18 +64,27 @@ Friends.prototype.list = function (username) {
     return friendArr(me).map((name) => ({ name, online: accounts.isOnline(name) }));
 };
 
-// Pending requests addressed TO me (I can accept/decline), with online flags.
+// Pending friend requests, split by direction. `incoming` are addressed TO me
+// (I can accept/decline); `outgoing` are ones I SENT (I can withdraw). Each entry
+// carries an online flag. Round 23 wave 3: the payload gained `outgoing` so the
+// client's 申请管理 (Requests) tab can render both sections.
 Friends.prototype.requests = function (username) {
     migrate(username);
     const me = acc(username);
-    if (!me) return [];
-    return incomingArr(me).map((name) => ({ name, online: accounts.isOnline(name) }));
+    if (!me) return { incoming: [], outgoing: [] };
+    return {
+        incoming: incomingArr(me).map((name) => ({ name, online: accounts.isOnline(name) })),
+        outgoing: outgoingArr(me).map((name) => ({ name, online: accounts.isOnline(name) })),
+    };
 };
 
-// Send a friend request. Does NOT create a friendship yet.
-// Returns { ok, error?, autoAccepted?, toOffline? }.
+// Send a friend request. Does NOT create a friendship yet — EXCEPT when the
+// target is a BOT (a virtual companion account that can never log in to accept):
+// then the request auto-accepts instantly and the friendship is mutual right
+// away. Returns { ok, error?, autoAccepted?, toOffline? }.
 Friends.prototype.request = function (username, targetName) {
     if (username === targetName) return { ok: false, error: 'Cannot add yourself' };
+    bots.seed(); // bots must always exist (idempotent; cheap)
     if (!accounts.exists(targetName)) return { ok: false, error: 'No such player: ' + targetName };
     migrate(username);
     migrate(targetName);
@@ -86,6 +96,21 @@ Friends.prototype.request = function (username, targetName) {
     if (friendArr(me).includes(targetName)) return { ok: false, error: 'Already friends' };
     // I already have a pending outgoing request to them.
     if (outgoingArr(me).includes(targetName)) return { ok: false, error: 'Request already sent' };
+
+    // BOT target: instant auto-accept. Make the friendship mutual immediately
+    // (both friends arrays), leave NO pending incoming/outgoing request, and
+    // return the autoAccepted shape so the protocol.js friendAdd handler runs
+    // its "friends now" branch for the requester (friendList + friendAdded +
+    // friendActionResult). The bot has no socket, so the handler's `other`
+    // emissions are naturally skipped. The 'Already friends' guard above keeps
+    // a bot from being double-added; friendRemove still works on a bot, so
+    // re-adding is always possible afterward.
+    if (bots.isBotName(targetName)) {
+        if (!friendArr(me).includes(targetName)) friendArr(me).push(targetName);
+        if (!friendArr(them).includes(username)) friendArr(them).push(username);
+        persistence.save();
+        return { ok: true, autoAccepted: true, toOffline: true };
+    }
 
     // If THEY already requested ME, this is effectively an accept -> mutual now.
     if (incomingArr(me).includes(targetName)) {
@@ -120,12 +145,34 @@ Friends.prototype.accept = function (username, fromName) {
     return { ok: true };
 };
 
-// Decline (or cancel) a request. `fromName` is the other party.
+// Decline (or cancel) a request. `fromName` is the other party. Only succeeds
+// when there actually IS a pending incoming request from `fromName` (mirror of
+// withdraw — a client can't decline a request that isn't pending).
 Friends.prototype.decline = function (username, fromName) {
     const me = acc(username);
     const them = acc(fromName);
-    if (me) me.incoming = incomingArr(me).filter((n) => n !== fromName);
+    if (!me) return { ok: false, error: 'No account' };
+    if (!incomingArr(me).includes(fromName)) {
+        return { ok: false, error: 'No pending request from: ' + fromName };
+    }
+    me.incoming = incomingArr(me).filter((n) => n !== fromName);
     if (them) them.outgoing = outgoingArr(them).filter((n) => n !== username);
+    persistence.save();
+    return { ok: true };
+};
+
+// Withdraw an OUTGOING request I sent to `targetName` (the requester-side mirror
+// of decline). Removes me from the target's incoming box too. Only succeeds when
+// the request is actually still pending (a client can't withdraw a friendship).
+Friends.prototype.withdraw = function (username, targetName) {
+    const me = acc(username);
+    const them = acc(targetName);
+    if (!me) return { ok: false, error: 'No account' };
+    if (!outgoingArr(me).includes(targetName)) {
+        return { ok: false, error: 'No outgoing request to: ' + targetName };
+    }
+    me.outgoing = outgoingArr(me).filter((n) => n !== targetName);
+    if (them) them.incoming = incomingArr(them).filter((n) => n !== username);
     persistence.save();
     return { ok: true };
 };

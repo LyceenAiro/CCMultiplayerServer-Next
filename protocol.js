@@ -4,6 +4,7 @@
 // is honoured; until then all other events are dropped.
 const accounts = require('./accounts');
 const friends = require('./friends');
+const bots = require('./bots');
 const party = require('./party');
 const world = require('./world');
 const persistence = require('./persistence');
@@ -109,6 +110,24 @@ function handleConnection(socket) {
 		world.broadcastToInstance(ctx, username, 'playerPing', { name: username, ping, isHost: world.isHostUser(username) });
 	});
 
+	// ---- round 25: netPing/netPong network-quality probe ----
+	// Post-auth ping echo for the HUD network-quality badges. Unlike mpPing (which
+	// runs PRE-auth to measure handshake latency), netPing is a normal game event:
+	// auth-gated like the rest, rate-limited to ~4/s, and the echo only goes out
+	// when both t and seq survive integer validation. Garbage payloads are dropped,
+	// never echoed. The client matches the {t, seq} back to its probe to compute
+	// median RTT + packet loss over a sliding window.
+	socket.on('netPing', function (data) {
+		if (dropIfNotAuthed('netPing')) return;
+		if (rateLimited('netPing', 4)) return;
+		const t = Number(data && data.t);
+		const seq = Number(data && data.seq);
+		if (!Number.isInteger(t) || !Number.isInteger(seq)) return;
+		if (t < 0 || t > 0xffffffffffff) return; // sane timestamp window
+		if (seq < 0 || seq > 0xffffffff) return; // seq is a client counter, small
+		socket.emit('netPong', { t, seq });
+	});
+
 	// Whitelist the profile fields we display (Social info box). The profile is
 	// cached server-side and amplified to friends/joiners, so never store or
 	// forward a raw client blob.
@@ -131,8 +150,11 @@ function handleConnection(socket) {
 	}
 
 	function broadcastPresence(name, online) {
-		// Notify friends + party members (and, for simplicity, everyone in the
-		// same instance) that this player's online state changed.
+		// Notify friends + anyone with a pending request involving them + party
+		// members that this player's online state changed. (An earlier comment
+		// claimed "everyone in the same instance" too — that broadcast never
+		// existed; instance presence comes from the client pulling friendList /
+		// roomPlayers instead.)
 		const targets = friends.presenceSubscribers(name);
 		const partyId = party.partyOf(name);
 		if (partyId) {
@@ -145,13 +167,51 @@ function handleConnection(socket) {
 		}
 	}
 
-	function pushPartyUpdate(partyId) {
+	function pushPartyUpdate(partyId, lastLeft) {
 		const p = party.getParty(partyId);
 		if (!p) return;
+		// Round 23 wave 3: `lastLeft` rides the roster broadcast (additive, optional)
+		// so clients can toast the departure MANNER — {name, reason} where reason is
+		// 'left' | 'kicked' | 'disconnected'. Absent -> clients default to 'left'.
+		const payload = { partyId: p.id, leader: p.leader, members: p.members.slice() };
+		if (lastLeft) payload.lastLeft = lastLeft;
 		for (const m of p.members) {
 			const s = accounts.getSocket(m);
-			if (s) s.emit('partyUpdate', { partyId: p.id, leader: p.leader, members: p.members.slice() });
+			if (s) s.emit('partyUpdate', payload);
 		}
+	}
+
+	// ---- round 23: paced save DOWNLOAD (handshakeResponse no longer carries save) ----
+	// The client expects its save as a stream of `saveDownload` parts right after the
+	// handshake: 8192-char chunks paced at config.saveDownloadKbS (default 200 kb/s,
+	// ≈320ms apart) so a login burst can't spike the network. A player with no save
+	// gets a single `saveDownload {slot:'autoSlot', total:0}` marker instead. The
+	// timer chain is per-socket and cleared on disconnect; one download per login
+	// (the handshake handler only runs once per connection — reconnects re-identify
+	// and get a fresh stream, which the client handles by resetting its assembler).
+	const SAVE_DOWNLOAD_PART = 8192;
+	function streamSaveDownload(raw) {
+		const parts = [];
+		if (typeof raw === 'string' && raw.length) {
+			for (let i = 0; i < raw.length; i += SAVE_DOWNLOAD_PART) parts.push(raw.substring(i, i + SAVE_DOWNLOAD_PART));
+		}
+		const total = parts.length;
+		if (socket._mpSaveDownloadTimer) { clearTimeout(socket._mpSaveDownloadTimer); socket._mpSaveDownloadTimer = null; }
+		if (total === 0) {
+			socket.emit('saveDownload', { slot: 'autoSlot', total: 0, seq: 0, part: '' });
+			return;
+		}
+		// Part-to-part delay so the average rate is exactly saveDownloadKbS kb/s.
+		const intervalMs = Math.max(1, Math.round(SAVE_DOWNLOAD_PART * 8 / (config.saveDownloadKbS * 1024) * 1000));
+		let seq = 0;
+		const next = () => {
+			if (socket.disconnected || !socket.connected) return;
+			socket.emit('saveDownload', { slot: 'autoSlot', total, seq, part: parts[seq] });
+			seq++;
+			if (seq < total) socket._mpSaveDownloadTimer = setTimeout(next, intervalMs);
+			else socket._mpSaveDownloadTimer = null;
+		};
+		socket._mpSaveDownloadTimer = setTimeout(next, intervalMs);
 	}
 
 	// ---- login ----
@@ -226,8 +286,11 @@ function handleConnection(socket) {
 			// client already sent its own version in the handshake payload).
 			version: config.version,
 			mapName: null, // no forced map; the client uses its own save / start map
-			save: save && save.autoSlot ? { slot: 'autoSlot', data: save.autoSlot } : null,
 		});
+		// Round 23: the save is NO LONGER embedded in the handshakeResponse (that
+		// sent a ~60KB string in one packet). It is streamed as paced saveDownload
+		// parts (config.saveDownloadKbS) right after — see streamSaveDownload above.
+		streamSaveDownload(save && save.autoSlot ? save.autoSlot : null);
 
 		// Proactively push the friend's list right after login. Friends are persisted
 		// server-side, so a returning player already HAS friends — but their client
@@ -241,6 +304,9 @@ function handleConnection(socket) {
 	});
 
 	socket.on('disconnect', function () {
+		// Round 23: clear any in-flight save-download timer chain (the socket is going
+		// away; a timer left behind would emit into a dead socket on a later tick).
+		if (socket._mpSaveDownloadTimer) { clearTimeout(socket._mpSaveDownloadTimer); socket._mpSaveDownloadTimer = null; }
 		if (!username) return;
 		console.log('[protocol] ' + username + ' disconnected');
 		doLogout();
@@ -273,7 +339,8 @@ function handleConnection(socket) {
 			// LONGER teleports survivors to a town (that yanked members out of the
 			// field mid-fight). removeMember transfers leadership, the partyId (and
 			// therefore the instanceId) is unchanged, and everyone keeps playing.
-			pushPartyUpdate(updated.id);
+			// Round 23 wave 3: the survivors get the departure manner in lastLeft.
+			pushPartyUpdate(updated.id, { name: name, reason: 'disconnected' });
 		} else {
 			// removeMember returned null => the party was disbanded (e.g. a 2-person
 			// party lost its leader). The survivor stays in place but moves from the
@@ -325,6 +392,19 @@ function handleConnection(socket) {
 			console.log('[protocol] ' + username + ' exited PVP isolation on ' + mapName);
 		}
 
+		// Round 23: area-save anti-spam — track the latest map switches. A player who
+		// churns maps (>=5 switches in the last 3s) gets its AREA saves suppressed
+		// until 5s after the LAST switch (the saveChunk final-chunk step checks this).
+		{
+			const now = Date.now();
+			if (!Array.isArray(socket._mpChangeTimes)) socket._mpChangeTimes = [];
+			socket._mpChangeTimes.push(now);
+			socket._mpLastChangeMapAt = now;
+			const cutoff = now - 3000;
+			while (socket._mpChangeTimes.length && socket._mpChangeTimes[0] < cutoff) socket._mpChangeTimes.shift();
+			while (socket._mpChangeTimes.length > 16) socket._mpChangeTimes.shift();
+		}
+
 		const result = world.changeMap(ctx, username, mapName, areaType, pos);
 		socket.emit('changeMapResponse', result);
 	});
@@ -336,11 +416,19 @@ function handleConnection(socket) {
 	});
 
 	// ---- NEW sync system: whole-state broadcast (replaces per-entity deltas) ----
-	// Every client streams its own full player state each frame. The username is
-	// authoritative (stamped server-side). No host gate — each player owns their state.
+	// Every client streams its own full player state. The username is authoritative
+	// (stamped server-side). No host gate — each player owns their state.
+	// Round 22 (opt 4): per-socket latest-wins relay cap ~25/s. The client already
+	// caps its own stream at 20Hz (50ms floor), so a well-behaved socket is never
+	// gated here — this only bounds a buggy/hostile client flooding every frame.
+	// SIMPLEST acceptable: drop a playerState arriving <40ms after the last relayed
+	// one (the next accepted packet carries fresh state anyway, so no staleness).
 	socket.on('playerState', function (s) {
 		if (dropIfNotAuthed('playerState')) return;
 		if (!s || !isValidPos(s.pos)) return;
+		const now = Date.now();
+		if (socket._mpLastPlayerStateRelay && now - socket._mpLastPlayerStateRelay < 40) return;
+		socket._mpLastPlayerStateRelay = now;
 		world.updateMemberPos(username, s.pos);
 		world.broadcastToInstance(ctx, username, 'playerState', {
 			player: username, pos: s.pos, face: s.face, anim: s.anim,
@@ -355,6 +443,28 @@ function handleConnection(socket) {
 			// owner is in a cutscene, instead of showing it mid-anim outside the
 			// cutscene's own actor set.
 			cs: s.cs ? 1 : 0,
+			// Round 11/22 (opt 3): element mode + class drive the mirror's melee
+			// sweep FX. They change rarely, so the client omits them when unchanged;
+			// when present they're whitelisted (number 0-4 / bounded string). The
+			// receiver guards on presence, so absent values are simply ignored.
+			em: (typeof s.em === 'number' && s.em >= 0 && s.em <= 4) ? s.em : undefined,
+			cl: (typeof s.cl === 'string' && s.cl.length <= 32) ? s.cl : undefined,
+			// Round 27 (item 4) / Round 29 (fix): host-authoritative guard state.
+			// The host recomputes monster damage against the member's REAL guard
+			// timing + defense (recomputeHostMonsterHit); without these fields the
+			// guard edge never reached the host and EVERY hit landed unguarded
+			// (attacks passed straight through the member's shield). gd/gst/gws
+			// ride every guard packet; gw/gm/ga/def are omitted when unchanged
+			// (opt-3) — relay them through as-is so the receiver's presence-guard
+			// cache keeps working.
+			gd: s.gd ? 1 : 0,
+			gst: (typeof s.gst === 'number' && s.gst >= 0) ? s.gst : undefined,
+			gws: (typeof s.gws === 'number') ? s.gws : undefined,
+			gw: (typeof s.gw === 'number') ? s.gw : undefined,
+			gm: (typeof s.gm === 'number') ? s.gm : undefined,
+			ga: (typeof s.ga === 'number') ? s.ga : undefined,
+			def: (typeof s.def === 'number') ? s.def : undefined,
+			ggt: (typeof s.ggt === 'number') ? s.ggt : undefined,
 		});
 	});
 	// Only the instance host broadcasts the entity (enemy) state block. Keyed by the
@@ -364,7 +474,10 @@ function handleConnection(socket) {
 		if (dropIfNotAuthed('entityState')) return;
 		if (!block || typeof block.map !== 'string' || !Array.isArray(block.e)) return;
 		if (block.e.length > 512) return; // sanity cap
-		world.broadcastHostState(ctx, username, 'entityState', { map: block.map, e: block.e, cb: !!block.cb });
+		// Round 24: f:1 marks a force-FULL block (the ~1s heartbeat). Whitelisted so it
+		// survives relay — members count full-flagged blocks to learn the host's roster.
+		const f = block.f === 1 ? 1 : undefined;
+		world.broadcastHostState(ctx, username, 'entityState', { map: block.map, e: block.e, cb: !!block.cb, f });
 	});
 
 	// ---- round 19: cutscene-spawned monster sync (NON-host streaming) ----
@@ -401,7 +514,128 @@ function handleConnection(socket) {
 		if (rateLimited('enemyAttack', 50)) return;
 		if (!data || typeof data.uid !== 'number') return;
 		if (typeof data.anim !== 'string' || !data.anim || data.anim.length > 64) return;
-		world.broadcastHostState(ctx, username, 'enemyAttack', { uid: data.uid, anim: data.anim });
+		// Round 22 (RC1): the targeted member's username rides along (null when the
+		// host/bot/unknown was targeted). Whitelisted like every other relayed field.
+		const t = (typeof data.t === 'string' && isValidName(data.t)) ? data.t : null;
+		world.broadcastHostState(ctx, username, 'enemyAttack', { uid: data.uid, anim: data.anim, t });
+	});
+
+	// ---- round 33 (item 2b): host relays an enemy sound so member puppets aren't silent ----
+	// Member puppets run NO local AI, so the engine's AI-driven PLAY_SOUND / PLAY_RANDOM_SOUND
+	// steps never fire on a member — every enemy action is silent for them. The instance host
+	// detects a real enemy's sound (a hook on ig.SoundHelper.playAtEntity /
+	// ig.Sound.prototype.play) and relays the sound's path + playback params here so every
+	// member replays it locally, positioned on their same-uid puppet. Host-only relay like
+	// enemyAttack/loot (broadcastHostState no-ops unless the sender IS the instance host),
+	// auth-gated + rate-limited; the payload is whitelisted field-by-field (never a raw blob).
+	socket.on('enemySound', function (data) {
+		if (dropIfNotAuthed('enemySound')) return;
+		if (rateLimited('enemySound', 60)) return;
+		if (!data || typeof data.uid !== 'number' || !Number.isInteger(data.uid) || data.uid <= 0) return;
+		if (typeof data.path !== 'string' || !data.path || data.path.length > 200) return;
+		const volume = (typeof data.volume === 'number' && isFinite(data.volume)) ? Math.max(0, Math.min(1, data.volume)) : 1;
+		const variance = (typeof data.variance === 'number' && isFinite(data.variance)) ? Math.max(0, Math.min(1, data.variance)) : 0;
+		const radius = (typeof data.radius === 'number' && isFinite(data.radius)) ? Math.max(0, Math.min(64, data.radius)) : undefined;
+		const speed = (typeof data.speed === 'number' && isFinite(data.speed)) ? Math.max(0.1, Math.min(4, data.speed)) : undefined;
+		world.broadcastHostState(ctx, username, 'enemySound', {
+			uid: data.uid, path: data.path, volume, variance,
+			loop: data.loop === true, global: data.global === true,
+			...(radius !== undefined ? { radius } : {}),
+			...(speed !== undefined ? { speed } : {}),
+		});
+	});
+
+	// ---- round 34 (item 3): member relays ONE of its OWN player's attack sounds ----
+	// A remote player's attack sounds (the 5 melee-swing segments, the ball THROW) are
+	// played on an ig.ENTITY.Effect whose .target is the acting player, all global:false,
+	// so the host-only/Enemy-gated enemySound relay never captures them and the other
+	// clients hear an incomplete set. Any client that detects its OWN player's attack
+	// sound relays it here so every OTHER same-instance client replays it positioned on
+	// the attacker's mirror. Sender->instance like skillFx (broadcastToInstance), NOT the
+	// host-only broadcastHostState (both host and member players attack). Auth-gated +
+	// rate-limited; the payload is whitelisted field-by-field.
+	socket.on('playerSound', function (data) {
+		if (dropIfNotAuthed('playerSound')) return;
+		if (rateLimited('playerSound', 60)) return;
+		if (!data || typeof data.path !== 'string' || !data.path || data.path.length > 200) return;
+		const volume = (typeof data.volume === 'number' && isFinite(data.volume)) ? Math.max(0, Math.min(1, data.volume)) : 1;
+		const variance = (typeof data.variance === 'number' && isFinite(data.variance)) ? Math.max(0, Math.min(1, data.variance)) : 0;
+		const radius = (typeof data.radius === 'number' && isFinite(data.radius)) ? Math.max(0, Math.min(64, data.radius)) : undefined;
+		const speed = (typeof data.speed === 'number' && isFinite(data.speed)) ? Math.max(0.1, Math.min(4, data.speed)) : undefined;
+		// ROUND 41 (item 2a): the host relays a MEMBER-husk's plain (unguarded) hit-receive
+		// sound by overriding the packet's player tag to that member's name, so every watcher
+		// (including the hit member) replays it on the victim's own mirror. Whitelist the tag
+		// to a real OTHER player currently in the instance (never the sender's own name — a
+		// sender faking its own name would be dropped by every watcher's self-check anyway);
+		// on any mismatch fall back to stamping the sender. Client applyPlayerSound is
+		// unchanged (it already keys on the packet's player field).
+		let playerTag = username;
+		if (typeof data.player === 'string' && data.player && data.player !== username) {
+			try {
+				const members = (typeof world.getInstanceMembers === 'function') ? world.getInstanceMembers(username) : [];
+				if (members && members.indexOf(data.player) !== -1) playerTag = data.player;
+			} catch (_) { /* fall back to the sender's name */ }
+		}
+		world.broadcastToInstance(ctx, username, 'playerSound', {
+			player: playerTag, path: data.path, volume, variance,
+			loop: data.loop === true,
+			...(radius !== undefined ? { radius } : {}),
+			...(speed !== undefined ? { speed } : {}),
+		});
+	});
+
+	// ---- round 39 (item 1): a client RELEASED a sustained (looped) sound ----
+	// The skill charge-up is relayed as a loop:true playerSound (so it plays continuously
+	// like the native held charge) and is CUT on release by this packet — the old one-shot
+	// relay let the final charge level ring out past release. Sender->instance like
+	// playerSound (broadcastToInstance, both host and member players charge); auth-gated +
+	// rate-limited; the payload is only the sender's name (no blob).
+	socket.on('soundStop', function (data) {
+		if (dropIfNotAuthed('soundStop')) return;
+		if (rateLimited('soundStop', 60)) return;
+		world.broadcastToInstance(ctx, username, 'soundStop', { player: username });
+	});
+
+	// ---- round 23: host grants credits/items to members when it kills a monster ----
+	// The instance host's death chain (EnemyType.resolveDefeat) grants credits + item
+	// drops to the HOST's player. The host relays them here so every member's client
+	// grants the SAME amounts to its own player (resolveDefeat runs only on the host's
+	// authority). Host-only relay like entityState/enemyAttack (broadcastHostState
+	// no-ops unless the sender IS the instance host), auth-gated + rate-limited; the
+	// payload is whitelisted field-by-field (never a raw blob).
+	socket.on('loot', function (data) {
+		if (dropIfNotAuthed('loot')) return;
+		if (rateLimited('loot', 50)) return;
+		// Round 24 (loot fairness): uid must be a positive finite number (rejects the
+		// 0/negative uids some old hosts could emit).
+		if (!data || !isFinite(data.uid) || data.uid <= 0) return;
+		const credit = Number(data.credit);
+		if (!isFinite(credit) || credit < 0 || credit > 1000000) return;
+		// boosterState: the enemy's booster state, coerced to an integer 0..10 (default 0).
+		let boosterState = 0;
+		if (isFinite(Number(data.boosterState))) {
+			boosterState = Math.max(0, Math.min(10, Math.round(Number(data.boosterState))));
+		}
+		// drops: the RAW drop table (cap 16). Each entry is coerced field-by-field so a
+		// member can roll its own drops safely (never a raw blob).
+		if (!Array.isArray(data.drops) || data.drops.length > 16) return;
+		const drops = [];
+		for (const m of data.drops) {
+			if (!m || typeof m !== 'object') continue;
+			const item = (typeof m.item === 'string') ? m.item : (m.item != null ? String(m.item) : '');
+			if (!item || item.length > 32) continue;
+			const prob = Number(m.prob);
+			if (!isFinite(prob) || prob < 0 || prob > 1) continue;
+			let min = Number(m.min);
+			if (!isFinite(min)) min = 1;
+			min = Math.max(0, Math.min(99, Math.round(min)));
+			let max = Number(m.max);
+			if (!isFinite(max)) max = 0;
+			max = Math.max(0, Math.min(99, Math.round(max)));
+			const rank = (typeof m.rank === 'string') ? m.rank : '';
+			drops.push({ item: item.slice(0, 32), prob, min, max, rank: rank.slice(0, 16), boosted: !!m.boosted });
+		}
+		world.broadcastHostState(ctx, username, 'loot', { uid: Math.round(data.uid), credit: Math.round(credit), boosterState, drops });
 	});
 
 	socket.on('updateAnimation', function (data) {
@@ -455,7 +689,12 @@ function handleConnection(socket) {
 		if (rateLimited('combatHit', 50)) return;
 		if (!data || !isValidName(data.player)) return;
 		const dmg = Number(data.damage);
-		if (!isFinite(dmg) || dmg <= 0 || dmg > 100000) return;
+		// ROUND 27: a PERFECT-guard hit carries damage 0 (the member plays the counter
+		// window + FX even though no HP is lost), so allow 0 — but ONLY for a flagged
+		// monster hit. Every other hit still requires damage > 0.
+		const isMonster = data.monster === true;
+		if (!isFinite(dmg) || dmg > 100000) return;
+		if (dmg <= 0 && !(isMonster && data.perfect === true)) return;
 		world.broadcastToInstance(ctx, username, 'combatHit', {
 			player: data.player,
 			damage: Math.round(dmg),
@@ -468,6 +707,51 @@ function handleConnection(socket) {
 			// Round 20: the attacker's attack stat so a guarding owner can apply the
 			// engine's PLAYER-shield damage reduction to the forwarded hit.
 			attack: typeof data.attack === 'number' && isFinite(data.attack) && data.attack > 0 ? data.attack : 0,
+			// ROUND 27 (host-authoritative monster damage): passthrough verdict flags.
+			// The host's recomputeHostMonsterHit emits these; the member applies them
+			// VERBATIM (perfect = 0 damage + counter window; regular = chip + guard bar;
+			// knockback = whether the engine knockback fires). PvP hits omit them.
+			monster: isMonster ? true : undefined,
+			perfect: data.perfect === true ? true : undefined,
+			regular: data.regular === true ? true : undefined,
+			knockback: typeof data.knockback === 'boolean' ? data.knockback : undefined,
+			// ROUND 42 (Symptom 1): the attack's REAL sc.ATTACK_TYPE (melee MEDIUM/HEAVY/
+			// MASSIVE), relayed from hitProps.visualType so the member plays the correct
+			// hit sound (a hardcoded LIGHT made every melee hit sound like a ball-hit).
+			attackType: typeof data.attackType === 'number' && isFinite(data.attackType) && data.attackType > 0 ? data.attackType : undefined,
+			// ROUND 43 (enemy-hurt sound for teammates): the attacker's ATTACK ELEMENT,
+			// forwarded from the member's local hit so every spectator can re-run
+			// showHitEffect on the enemy PUPPET (the host's puppet-onDamage is silent,
+			// so nothing native plays for them). Distinct from `element` (the monster's
+			// element on a combatHit) — attackElement is what showHitEffect needs to
+			// pick the connect sound (NEUTRAL+LIGHT etc.) + material hit-receive.
+			attackElement: typeof data.attackElement === 'number' && isFinite(data.attackElement) && data.attackElement >= 0 && data.attackElement <= 4 ? Math.round(data.attackElement) : undefined,
+		});
+	});
+
+	// ---- ROUND 43 (skill-release sound): replay a skill's FIRE sound on mirrors ----
+	// The host's playAtEntity observer that relays enemy + charged-ball sounds also
+	// silences SKILL-projectile launch sounds locally and (before this round) sent
+	// nothing, so a skill like 回旋斩 / charged shots fired with NO sound for anyone
+	// but the caster. The firing client emits the sound path it suppressed; every
+	// other client replays it positioned on the caster's MIRROR. Loop sounds stay on
+	// the existing playerSound/enemySound sustained-handle path; this is one-shots.
+	socket.on('skillSound', function (data) {
+		if (dropIfNotAuthed('skillSound')) return;
+		if (rateLimited('skillSound', 60)) return;
+		if (!data || typeof data.path !== 'string' || data.path.length > 200) return;
+		if (!isValidName(data.player)) return;
+		const vol = Number(data.volume);
+		const varn = Number(data.variance);
+		const spd = Number(data.speed);
+		const rad = Number(data.radius);
+		world.broadcastToInstance(ctx, username, 'skillSound', {
+			player: data.player,
+			path: data.path,
+			volume: isFinite(vol) && vol > 0 && vol <= 2 ? vol : undefined,
+			variance: isFinite(varn) && varn >= 0 && varn <= 1 ? varn : undefined,
+			speed: isFinite(spd) && spd > 0 && spd <= 4 ? spd : undefined,
+			radius: isFinite(rad) && rad > 0 ? rad : undefined,
 		});
 	});
 
@@ -482,10 +766,83 @@ function handleConnection(socket) {
 		if (!data || typeof data.uid !== 'number') return;
 		const dmg = Number(data.damage);
 		if (!isFinite(dmg) || dmg <= 0 || dmg > 100000) return;
+		// ROUND 32 (item 3c): pass through the REAL attack's interrupt/knockback
+		// strength. Old clients omit these -> type defaults to 2 (MEDIUM, the old
+		// fabricated value) so behaviour is unchanged for a mixed client/server pair.
+		let type = Number(data.type);
+		if (!isFinite(type) || type < 0 || type > 5) type = 2;
+		let knockback = Number(data.knockback);
+		if (!isFinite(knockback) || knockback < 0 || knockback > 10) knockback = 0;
+		// ROUND 44 (Gap A spectator enemy-hurt sound): the attacker relays its own hurt
+		// FX (the engine suppresses the puppet's native showHitEffect), so spectators need
+		// the connect+receive replay. Carry the attack's element + critical + ball so the
+		// spectator's replayed showHitEffect picks the right material/element sound. Old
+		// clients omit these -> neutral/non-crit defaults (behaviour unchanged).
+		let attackElement = Number(data.attackElement);
+		if (!isFinite(attackElement) || attackElement < 0 || attackElement > 4) attackElement = 0;
 		world.broadcastToInstance(ctx, username, 'enemyDamage', {
 			uid: data.uid,
 			damage: Math.round(dmg),
 			attacker: username, // authoritative sender, never client-supplied
+			type: Math.round(type),
+			ball: data.ball === true,
+			charged: data.charged === true,
+			knockback: knockback,
+			attackElement: Math.round(attackElement),
+			critical: data.critical === true,
+		});
+	});
+
+	// ---- round 21: a MEMBER reports a monster hit it detected locally ----
+	// The member now runs monster-hit DAMAGE locally (native pipeline: guard / i-frames /
+	// knockback / perfect guard). Its real HP streams to the host via playerState anyway,
+	// so this relay is BOOKKEEPING/telemetry only — the host does NOT re-apply any damage.
+	// Mirrors the enemyDamage relay: authed + rate-limited + field-validated, then
+	// broadcast back into the instance (only the host's client consumes it).
+	socket.on('combatResult', function (data) {
+		if (dropIfNotAuthed('combatResult')) return;
+		if (rateLimited('combatResult', 50)) return;
+		if (!data || typeof data.uid !== 'number') return;
+		const dmg = Number(data.damage);
+		if (!isFinite(dmg) || dmg < 0 || dmg > 100000) return; // a perfect guard can be 0
+		if (typeof data.guarded !== 'boolean') return;
+		world.broadcastToInstance(ctx, username, 'combatResult', {
+			uid: data.uid,
+			damage: Math.round(dmg),
+			guarded: data.guarded,
+		});
+	});
+
+	// ---- round 24: monster COUNTER / GUARD-BREAK fx relay ----
+	// Any instance client (host on its real enemies, members on their puppets) detects
+	// a counter/guard-break and relays it here so every OTHER client replays the same
+	// visual on its copy of the enemy. Same-instance relay like the other combat
+	// events (broadcastToInstance excludes the sender), auth-gated + rate-limited;
+	// the payload is whitelisted field-by-field ({uid, kind}), never a raw blob.
+	socket.on('combatFx', function (data) {
+		if (dropIfNotAuthed('combatFx')) return;
+		if (rateLimited('combatFx', 20)) return;
+		if (!data || typeof data.uid !== 'number' || !Number.isInteger(data.uid) || data.uid <= 0) return;
+		if (data.kind !== 'counter' && data.kind !== 'break') return;
+		world.broadcastToInstance(ctx, username, 'combatFx', { from: username, uid: data.uid, kind: data.kind });
+	});
+
+	// ---- round 45 (Gap A, host origin): the HOST applied a member's forwarded hit to a
+	// real enemy. The server self-drops enemyDamage back to that member, so any OTHER member
+	// spectating heard nothing. The host relays a cosmetic-only notice (NO damage here — HP
+	// already moved via enemyDamage) so every other member replays the enemy's hurt FX on its
+	// own puppet. Host-only (broadcastHostState), field-whitelisted, cosmetic only.
+	socket.on('enemyHurt', function (data) {
+		if (dropIfNotAuthed('enemyHurt')) return;
+		if (rateLimited('enemyHurt', 50)) return;
+		if (!data || typeof data.uid !== 'number' || !Number.isInteger(data.uid) || data.uid <= 0) return;
+		let type = Number(data.type);
+		if (!isFinite(type) || type < 0 || type > 5) type = 2;
+		let attackElement = Number(data.attackElement);
+		if (!isFinite(attackElement) || attackElement < 0 || attackElement > 4) attackElement = 0;
+		world.broadcastHostState(ctx, username, 'enemyHurt', {
+			uid: data.uid, type: Math.round(type),
+			attackElement: Math.round(attackElement), critical: data.critical === true,
 		});
 	});
 
@@ -599,7 +956,9 @@ function handleConnection(socket) {
 	socket.on('friendAdd', function (data) {
 		if (dropIfNotAuthed('friendAdd')) return;
 		const target = data && data.name;
-		if (!isValidName(target)) {
+		// Bots: the official companion names may include characters outside the
+		// plain \w username charset (e.g. "C'tron"), so they get a carve-out.
+		if (!isValidName(target) && !bots.isBotName(target)) {
 			socket.emit('friendActionResult', { action: 'request', ok: false, error: 'No such player' });
 			return;
 		}
@@ -613,12 +972,39 @@ function handleConnection(socket) {
 			socket.emit('friendList', { friends: friends.list(username) });
 			const other = accounts.getSocket(target);
 			if (other) other.emit('friendList', { friends: friends.list(target) });
+			// Round 23 wave 3: mutual auto-accept = friends now — toast BOTH users.
+			socket.emit('friendAdded', { name: target });
+			if (other) other.emit('friendAdded', { name: username });
+			// Round 23 review: mirror the normal request-success result to the
+			// REQUESTER so their add-friend window closes + toasts — the auto-accept
+			// branch used to return early, leaving the window open on their side.
+			socket.emit('friendActionResult', { action: 'request', ok: true, to: target, toOffline: res.toOffline });
+			// Requests lists shrank on both sides; refresh them.
+			socket.emit('friendRequests', { requests: friends.requests(username) });
+			if (other) other.emit('friendRequests', { requests: friends.requests(target) });
+			// Round 23 review: push the newly-mutual friend's cached profile so the
+			// Social info box shows real stats on first open (same mechanism as the
+			// client-requested friendList path).
+			try {
+				const prof = world.getAccountProfile(target);
+				if (prof) socket.emit('updatePlayerProfile', { player: target, profile: prof });
+				if (other) {
+					const prof2 = world.getAccountProfile(username);
+					if (prof2) other.emit('updatePlayerProfile', { player: username, profile: prof2 });
+				}
+			} catch (e) { /* non-fatal */ }
 			return;
 		}
 		socket.emit('friendActionResult', { action: 'request', ok: true, to: target, toOffline: res.toOffline });
+		// Round 23 wave 3: the requester's outgoing list grew — refresh it so the
+		// 申请管理 tab + the add-friend window's pending-state stay accurate.
+		socket.emit('friendRequests', { requests: friends.requests(username) });
 		// Notify the target (if online) that they have an incoming request.
 		const other = accounts.getSocket(target);
-		if (other) other.emit('friendRequest', { from: username });
+		if (other) {
+			other.emit('friendRequest', { from: username });
+			other.emit('friendRequests', { requests: friends.requests(target) });
+		}
 	});
 	socket.on('friendAccept', function (data) {
 		if (dropIfNotAuthed('friendAccept')) return;
@@ -633,22 +1019,64 @@ function handleConnection(socket) {
 		socket.emit('friendList', { friends: friends.list(username) });
 		const other = accounts.getSocket(from);
 		if (other) other.emit('friendList', { friends: friends.list(from) });
+		// Round 23 wave 3: friendship established — toast BOTH users.
+		socket.emit('friendAdded', { name: from });
+		if (other) other.emit('friendAdded', { name: username });
+		// Round 23 review: push the newly-mutual friend's cached profile so the
+		// Social info box shows real stats on first open (same mechanism as the
+		// client-requested friendList path).
+		try {
+			const prof = world.getAccountProfile(from);
+			if (prof) socket.emit('updatePlayerProfile', { player: from, profile: prof });
+			if (other) {
+				const prof2 = world.getAccountProfile(username);
+				if (prof2) other.emit('updatePlayerProfile', { player: username, profile: prof2 });
+			}
+		} catch (e) { /* non-fatal */ }
+		// Requests lists shrank on both sides; refresh them.
+		socket.emit('friendRequests', { requests: friends.requests(username) });
+		if (other) other.emit('friendRequests', { requests: friends.requests(from) });
 	});
 	socket.on('friendDecline', function (data) {
 		if (dropIfNotAuthed('friendDecline')) return;
 		const from = data && data.name;
 		if (!isValidName(from)) return;
-		friends.decline(username, from);
+		if (from === username) {
+			// Self-guard: you can't decline a request to yourself.
+			socket.emit('friendActionResult', { action: 'decline', ok: false, error: 'Cannot decline yourself' });
+			return;
+		}
+		const res = friends.decline(username, from);
+		if (!res.ok) {
+			// Nothing was declined (no matching incoming request) — report the
+			// failure instead of refreshing both sides as if a request vanished.
+			socket.emit('friendActionResult', { action: 'decline', ok: false, error: res.error });
+			return;
+		}
 		socket.emit('friendRequests', { requests: friends.requests(username) });
+		// Round 23 wave 3: tell the requester their request was DECLINED (toast)
+		// and refresh their outgoing list too — only when a request was actually
+		// declined.
+		const other = accounts.getSocket(from);
+		if (other) {
+			other.emit('friendRequests', { requests: friends.requests(from) });
+			other.emit('friendRequestDeclined', { name: username });
+		}
 	});
 	socket.on('friendRemove', function (data) {
 		if (dropIfNotAuthed('friendRemove')) return;
-		if (!isValidName(data && data.name)) return;
-		friends.remove(username, data && data.name);
+		const name = data && data.name;
+		// Bot carve-out: "C'tron" fails the plain \w name check; removing a bot
+		// friend must keep working so the companion can be re-added afterward.
+		if (!isValidName(name) && !bots.isBotName(name)) return;
+		friends.remove(username, name);
 		// Refresh both sides so the removed entry disappears everywhere.
 		socket.emit('friendList', { friends: friends.list(username) });
-		const other = accounts.getSocket(data && data.name);
-		if (other) other.emit('friendList', { friends: friends.list(data.name) });
+		const other = accounts.getSocket(name);
+		if (other) other.emit('friendList', { friends: friends.list(name) });
+		// Round 23 review: deliberately NO cached-profile push here (unlike the
+		// accept/auto-accept sites) — the friendship just ended, so neither side's
+		// Social list shows the other anymore and the profile would be dead weight.
 	});
 	socket.on('friendList', function () {
 		if (dropIfNotAuthed('friendList')) return;
@@ -671,6 +1099,88 @@ function handleConnection(socket) {
 		socket.emit('friendRequests', { requests: friends.requests(username) });
 	});
 
+	// ---- round 23 wave 3: player SEARCH (the search-first add-friend flow) ----
+	// Reply ONLY to the requester: a capped list of exact/prefix/substring matches
+	// against every KNOWN account (username is identity; persistence.db.accounts is
+	// the source of truth). Level is NOT persisted — it's live in world's profile
+	// cache (updatePlayerProfile), so we carry it when known and omit it otherwise.
+	socket.on('searchPlayers', function (data) {
+		if (dropIfNotAuthed('searchPlayers')) return;
+		if (rateLimited('searchPlayers', 2)) return;
+		const raw = data && data.query;
+		if (typeof raw !== 'string') return;
+		const query = raw.trim();
+		if (query.length < 1 || query.length > 20) return;
+		const lower = query.toLowerCase();
+		const accs = persistence.db.accounts || {};
+		bots.seed(); // bots are virtual accounts: make sure they exist before listing
+		// Round 27 (item 1): FUZZY search. The query is matched as a case-insensitive
+		// SUBSTRING/regex against the username (any position — not just exact/prefix),
+		// and against a bot's searchable aliases (its native contact id, English and
+		// Chinese names) so a removed bot friend is re-addable by more than its
+		// account id. For non-bot accounts the username is the only searchable string.
+		const scored = [];
+		for (const name of Object.keys(accs)) {
+			// Bot carve-out: "C'tron" fails the plain \w name check but must still
+			// be searchable — that's how a removed bot friend is re-added.
+			if ((!isValidName(name) && !bots.isBotName(name)) || name === username) continue; // never list yourself
+			const nl = name.toLowerCase();
+			let rank = -1;
+			if (nl === lower) rank = 0;            // exact
+			else if (nl.indexOf(lower) === 0) rank = 1;  // prefix
+			else if (nl.indexOf(lower) !== -1) rank = 2; // substring
+			else if (bots.isBotName(name)) {
+				// Bot alias match (English/Chinese/contact id): ranked like a substring
+				// so it sorts after a direct name hit but still surfaces.
+				const aliases = bots.aliasesFor(name);
+				for (const a of aliases) {
+					if (a === lower) { rank = Math.max(rank, 1); break; }
+					if (a.indexOf(lower) !== -1) { rank = 2; break; }
+				}
+			}
+			if (rank < 0) continue;
+			const prof = world.getAccountProfile(name);
+			scored.push({
+				name,
+				rank,
+				online: accounts.isOnline(name),
+				level: prof && typeof prof.level === 'number' ? prof.level : undefined,
+			});
+		}
+		// Exact first, then online-first within a rank, then alphabetical.
+		scored.sort((a, b) => (a.rank - b.rank)
+			|| ((b.online ? 1 : 0) - (a.online ? 1 : 0))
+			|| (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+		const players = scored.slice(0, 8).map((m) => {
+			const p = { name: m.name, online: m.online };
+			if (typeof m.level === 'number') p.level = m.level;
+			return p;
+		});
+		socket.emit('searchPlayersResult', { query, players });
+	});
+
+	// ---- round 23 wave 3: WITHDRAW an outgoing friend request ----
+	// Removes it from the sender's outgoing box + the recipient's incoming box,
+	// pushes the refreshed requests list to BOTH sockets, and pokes the recipient
+	// with `friendRequestWithdrawn` so they can toast it.
+	socket.on('friendRequestWithdraw', function (data) {
+		if (dropIfNotAuthed('friendRequestWithdraw')) return;
+		const target = data && data.name;
+		if (!isValidName(target)) return;
+		const res = friends.withdraw(username, target);
+		if (!res.ok) {
+			socket.emit('friendActionResult', { action: 'withdraw', ok: false, error: res.error });
+			return;
+		}
+		socket.emit('friendRequests', { requests: friends.requests(username) });
+		const other = accounts.getSocket(target);
+		if (other) {
+			other.emit('friendRequests', { requests: friends.requests(target) });
+			other.emit('friendRequestWithdrawn', { name: username });
+		}
+		socket.emit('friendActionResult', { action: 'withdraw', ok: true, to: target });
+	});
+
 	// ---- party ----
 	socket.on('partyInvite', function (data) {
 		if (dropIfNotAuthed('partyInvite')) return;
@@ -680,7 +1190,22 @@ function handleConnection(socket) {
 			socket.emit('partyActionResult', { action: 'invite', ok: false, error: 'Player not online: ' + to });
 			return;
 		}
+		// Round 23 wave 3: busy-check — a player already sitting on a pending invite
+		// can't be invited again (two popups would race for their accept/decline).
+		// Checked BEFORE createParty/addInvite so no party/invite state is created.
+		if (party.hasPendingInvite(to)) {
+			socket.emit('partyActionResult', { action: 'invite', ok: false, error: 'busy' });
+			return;
+		}
 		const partyId = party.createParty(username);
+		// Round 23 review: never invite someone who is ALREADY a member of this
+		// party (createParty returns the inviter's existing party). Reject with the
+		// same partyActionResult error shape as the busy-check. The client doesn't
+		// special-case 'inparty', so it surfaces as a generic failure toast.
+		if (party.partyOf(to) === partyId) {
+			socket.emit('partyActionResult', { action: 'invite', ok: false, error: 'inparty' });
+			return;
+		}
 		// ROUND 12: combined party cap (players + host-side bots) is 8. Bots live
 		// client-side, so from the server's view the cap is simply 8 members.
 		const cur = party.getParty(partyId);
@@ -696,22 +1221,22 @@ function handleConnection(socket) {
 	socket.on('partyAccept', function (data) {
 		if (dropIfNotAuthed('partyAccept')) return;
 		const partyId = data && data.partyId;
-		if (!party.getParty(partyId)) {
+		const targetParty = party.getParty(partyId);
+		if (!targetParty) {
 			socket.emit('partyActionResult', { action: 'accept', ok: false, error: 'Party no longer exists' });
+			return;
+		}
+		// ROUND 12 + round 23 review: refuse to exceed the 8-member cap BEFORE
+		// consuming the invite, so a full party doesn't burn it (the invite stays
+		// valid for a later retry once someone leaves).
+		if (targetParty.members.length >= 8) {
+			socket.emit('partyActionResult', { action: 'accept', ok: false, error: '队伍已满（最多 8 人）' });
 			return;
 		}
 		// Only someone actually invited may join (partyId is guessable: p1, p2, ...).
 		if (!party.consumeInvite(partyId, username)) {
 			socket.emit('partyActionResult', { action: 'accept', ok: false, error: 'No invite to this party' });
 			return;
-		}
-		// ROUND 12: refuse to exceed the 8-member cap (race-safe re-check at accept).
-		{
-			const cap = party.getParty(partyId);
-			if (cap && cap.members.length >= 8) {
-				socket.emit('partyActionResult', { action: 'accept', ok: false, error: '队伍已满（最多 8 人）' });
-				return;
-			}
 		}
 		// Leave any current party first (forced disband of the acceptor's old party).
 		// Capture the survivors BEFORE removing so a 2-person disband still notifies
@@ -721,7 +1246,9 @@ function handleConnection(socket) {
 			? party.getParty(prevPartyId).members.filter((m) => m !== username) : [];
 		const prev = party.removeMember(username);
 		if (prev) {
-			pushPartyUpdate(prev.id);
+			// Round 23 wave 3: the acceptor left their OLD party — its survivors get
+			// the departure manner.
+			pushPartyUpdate(prev.id, { name: username, reason: 'left' });
 		} else {
 			for (const m of prevSurvivors) {
 				const s = accounts.getSocket(m);
@@ -735,6 +1262,13 @@ function handleConnection(socket) {
 		// Broadcast the new roster to EVERY member (inviter + invitee).
 		pushPartyUpdate(partyId);
 		const p = party.getParty(partyId);
+		if (!p) {
+			// Belt-and-braces: the party vanished between the invite check and the
+			// join (e.g. the leader disconnected + party disbanded raced the accept).
+			// Tell the acceptor it failed instead of throwing on p.members below.
+			socket.emit('partyActionResult', { action: 'accept', ok: false, error: 'Party no longer exists' });
+			return;
+		}
 		// ROUND 10: actively migrate every online member already on a map into the
 		// new party instance (solo:<u>:<map> -> party:<id>:<map>). The join path of
 		// world.changeMap emits the mutual onPlayerChangeMap enter events, so BOTH
@@ -815,7 +1349,8 @@ function handleConnection(socket) {
 		const updated = party.removeMember(username);
 		socket.emit('partyUpdate', null);
 		if (updated) {
-			pushPartyUpdate(updated.id);
+			// Round 23 wave 3: the leaver's manner rides the roster broadcast.
+			pushPartyUpdate(updated.id, { name: username, reason: 'left' });
 		} else {
 			// Party disbanded (2-person party lost a member) -> tell the survivor too.
 			for (const m of others) {
@@ -849,9 +1384,19 @@ function handleConnection(socket) {
 		if (!instanceId || !world.isHostOf(username, instanceId)) return;
 		let bots = (data && Array.isArray(data.bots)) ? data.bots : [];
 		bots = bots.filter((b) => typeof b === 'string' && b.length > 0 && b.length <= 32).slice(0, 8);
+		// Round 27 (item 2): `maps` tags each bot with the HOST's map so member HUDs
+		// can hide a bot's HP/SP/EXP bars + grey its net diamond while the bot (its
+		// owner) is off the member's map. Sanitized to {botName: mapName}. Cached on
+		// the instance so the replayed (late-joiner) broadcast keeps the maps.
+		let maps = {};
+		if (data && data.maps && typeof data.maps === 'object') {
+			for (const k in data.maps) {
+				if (typeof data.maps[k] === 'string' && data.maps[k].length <= 64) maps[k] = data.maps[k];
+			}
+		}
 		const inst = world.getInstance(instanceId);
-		if (inst) inst.bots = bots;
-		world.broadcastToInstance(ctx, username, 'partyBots', { bots: bots });
+		if (inst) { inst.bots = bots; inst.botMaps = maps; }
+		world.broadcastToInstance(ctx, username, 'partyBots', { bots: bots, maps: maps });
 	});
 
 	// ---- round 13: party LEADER streams live bot state (pos/anim/hp/level) ----
@@ -888,6 +1433,40 @@ function handleConnection(socket) {
 		});
 	});
 
+	// ---- round 27 (item 2): a member publishes THEIR current map to the party ----
+	// Teammates' HUDs hide an off-map member's HP/SP/EXP bars + grey the net diamond.
+	// Like botState this is NOT host-gated (any member reports their own map) — the
+	// payload is rebuilt field-by-field and relayed with `from` = the sender. The
+	// member's map is also cached on the instance so late joiners could replay it.
+	socket.on('memberMap', function (data) {
+		if (dropIfNotAuthed('memberMap')) return;
+		if (rateLimited('memberMap', 5)) return;
+		const map = (data && typeof data.map === 'string') ? data.map.slice(0, 64) : '';
+		const inst = world.getInstance(world.instanceOf(username));
+		if (inst) { if (!inst.memberMaps) inst.memberMaps = {}; inst.memberMaps[username] = map; }
+		world.broadcastToInstance(ctx, username, 'memberMap', { from: username, map: map });
+		// ROUND 30 (item 5): cross-instance map relay. broadcastToInstance only reaches
+		// members who share the sender's instance — once a member teleports to another
+		// map they STOP receiving the stayer's packets, so the stayer's HUD never
+		// learns they left (stale memberMapByName -> off-map bars keep showing). Relay
+		// the map to every ONLINE PARTY member (any party) regardless of instance; the
+		// client keys by name and compares against its own map, so a relay from
+		// another instance simply marks that member off-map. Also sent to the sender
+		// (they broadcast to their own instance via a direct emit on top).
+		if (map) {
+			const partyId = party.partyOf(username);
+			const p = partyId ? party.getParty(partyId) : null;
+			if (p && p.members) {
+				for (const m of p.members) {
+					if (m === username) continue;
+					const s = ctx.getSocket(m);
+					if (s) s.emit('memberMap', { from: username, map: map });
+				}
+			}
+			socket.emit('memberMap', { from: username, map: map });
+		}
+	});
+
 	// Leader-only: remove a member from the party (the 踢出 button). Mirrors the
 	// partyLeave bookkeeping, but the REQUESTER stays and the TARGET goes solo.
 	socket.on('partyKick', function (data) {
@@ -904,7 +1483,8 @@ function handleConnection(socket) {
 		const tSock = accounts.getSocket(target);
 		if (tSock) tSock.emit('partyUpdate', null);
 		if (updated) {
-			pushPartyUpdate(updated.id);
+			// Round 23 wave 3: the kicked member's manner rides the roster broadcast.
+			pushPartyUpdate(updated.id, { name: target, reason: 'kicked' });
 		} else {
 			// Party disbanded (kick dropped it to one person): tell the kicker and
 			// any survivors their party is gone too.
@@ -925,6 +1505,34 @@ function handleConnection(socket) {
 		}
 	});
 
+	// ---- round 23 wave 4: PARTY CHAT ----
+	// Party-only chat relay. The sender must be in a party; the message is
+	// delivered to every OTHER party member whose socket is authed AND currently
+	// in the SAME map instance as the sender (a member on another map/instance
+	// must not receive it — chat follows what you can actually see). The sender
+	// never receives an echo; the client renders its own message locally.
+	// Rate-limited (2/s per socket — plenty for human typing, stops a flood).
+	socket.on('chat', function (data) {
+		if (dropIfNotAuthed('chat')) return;
+		if (rateLimited('chat', 2)) return;
+		if (!data || typeof data.text !== 'string') return;
+		const text = data.text.trim();
+		if (text.length < 1 || text.length > 200) return;
+		const partyId = party.partyOf(username);
+		if (!partyId) return; // party-only: solo senders have nobody to reach
+		const p = party.getParty(partyId);
+		if (!p) return;
+		const senderInstanceId = world.instanceOf(username);
+		if (!senderInstanceId) return;
+		for (const m of p.members) {
+			if (m === username) continue; // no echo to the sender
+			if (!accounts.isOnline(m)) continue; // authed + connected
+			if (world.instanceOf(m) !== senderInstanceId) continue; // same instance only
+			const s = accounts.getSocket(m);
+			if (s) s.emit('chat', { from: username, text });
+		}
+	});
+
 	// ---- server-side save ----
 	socket.on('saveUpload', function (data) {
 		if (dropIfNotAuthed('saveUpload')) return;
@@ -939,6 +1547,98 @@ function handleConnection(socket) {
 		// without limit (a real CrossCode save is well under a few MB).
 		if (typeof data.data === 'string' && data.data.length > 8 * 1024 * 1024) return;
 		persistence.saveGame(username, slot, sanitizeSaveParty(data.data));
+	});
+
+	// ---- round 23: chunked, rate-limited save UPLOAD (saveChunk) ----
+	// The client splits a save into 8192-char parts and streams them paced at ~512
+	// kb/s (well under the cap). We enforce the per-socket upload cap
+	// (config.saveUploadKbS, default 1024 kb/s) with a token bucket, reassemble parts
+	// in order, sanitize + persist on the LAST part, then confirm with `saveSaved`.
+	// The generation counter lets rapid map switches abort an in-flight upload (a
+	// stale gen is dropped; only the newest save wins). AREA saves ride a change-storm
+	// gate so a player churning maps can't spam disk writes (see changeMap tracking).
+	function saveBucketConsume(bytes) {
+		// 1024 kb/s = 128 KB/s: kb/s is kilobits (bits), so divide by 8 to get bytes/s.
+		// Same unit convention as the client's saveUploadQueue pace (~512 kb/s = 64
+		// KB/s) and the saveDownload pacing below (part*8/(saveDownloadKbS*1024)).
+		const cap = config.saveUploadKbS * 1024 / 8; // bytes/second
+		const b = socket._mpSaveBucket || (socket._mpSaveBucket = { tokens: cap, last: Date.now() });
+		const now = Date.now();
+		// Refill continuously at `cap` bytes/s, capped at a full bucket.
+		b.tokens = Math.min(cap, b.tokens + (now - b.last) / 1000 * cap);
+		b.last = now;
+		if (b.tokens < bytes) return false;
+		b.tokens -= bytes;
+		return true;
+	}
+	socket.on('saveChunk', function (data) {
+		if (dropIfNotAuthed('saveChunk')) return;
+		if (!data || typeof data !== 'object') return;
+		// ---- validate shape ----
+		const slot = String(data.slot);
+		if (!isValidSlotKey(slot)) return;
+		const total = data.total;
+		const seq = data.seq;
+		const gen = data.gen;
+		if (!Number.isInteger(total) || total < 1 || total > 256) return;
+		if (!Number.isInteger(seq) || seq < 0 || seq >= total) return;
+		if (typeof data.part !== 'string' || data.part.length > 65536) return;
+		if (!Number.isInteger(gen) || gen < 0) return;
+		const reason = (typeof data.reason === 'string' && data.reason.length <= 16) ? data.reason : 'other';
+		const now = Date.now();
+		// 30s staleness sweep: a stream that stopped mid-way (or was aborted) must not
+		// accidentally complete later against a fresh one.
+		if (socket._mpSaveStream && now - socket._mpSaveStream.lastAt > 30000) socket._mpSaveStream = null;
+		// ---- token bucket (≤config.saveUploadKbS kb/s) ----
+		if (!saveBucketConsume(data.part.length)) {
+			// Over the cap: discard the in-flight stream. The client re-sends the whole
+			// save on its next trigger — tell it so it can log/retry.
+			socket._mpSaveStream = null;
+			socket.emit('saveFailed', { slot, reason: 'rate' });
+			return;
+		}
+		// ---- generation + assembly ----
+		const cur = socket._mpSaveStream;
+		if (cur && gen < cur.gen) return; // stale (aborted) upload — drop silently
+		if (!cur || gen > cur.gen || cur.slot !== slot || cur.total !== total) {
+			socket._mpSaveStream = { gen, slot, total, parts: [], reason, lastAt: now };
+		}
+		const stream = socket._mpSaveStream;
+		stream.reason = reason;
+		stream.lastAt = now;
+		// Order validation: seq must equal the parts count received so far.
+		if (seq !== stream.parts.length) {
+			// Out-of-order/corrupt stream — discard; the client re-uploads on its next
+			// trigger (a save is never persisted partially).
+			socket._mpSaveStream = null;
+			socket.emit('saveFailed', { slot, reason: 'corrupt' });
+			return;
+		}
+		stream.parts.push(data.part);
+		if (stream.parts.length === stream.total) {
+			const payload = stream.parts.join('');
+			socket._mpSaveStream = null;
+			// ---- area-change anti-spam ----
+			// A player who switched maps 5+ times in the last 3s is suppressed until 5s
+			// after the LAST switch. Non-area reasons bypass this entirely.
+			if (stream.reason === 'area') {
+				const times = socket._mpChangeTimes || [];
+				const cutoff = now - 3000;
+				while (times.length && times[0] < cutoff) times.shift();
+				const stormActive = times.length >= 5;
+				const until = socket._mpSaveSuppressUntil || 0;
+				if (stormActive || now < until) {
+					// Set to LAST SWITCH + 5s: while the storm is active the last switch
+					// keeps sliding forward (suppression continues); after it ends the
+					// window lapses naturally 5s after the final switch.
+					socket._mpSaveSuppressUntil = (socket._mpLastChangeMapAt || now) + 5000;
+					socket.emit('saveFailed', { slot: stream.slot, reason: 'suppressed' });
+					return;
+				}
+			}
+			persistence.saveGame(username, stream.slot, sanitizeSaveParty(payload));
+			socket.emit('saveSaved', { slot: stream.slot, bytes: payload.length });
+		}
 	});
 
 	// The client can (older builds always did) serialize its injected multiplayer
