@@ -4,7 +4,7 @@
 // in that instance (the server itself runs no game logic).
 //
 // instanceId rules (I1):
-//   shared-town area          -> town:<mapName>            (whole server shares)
+//   shared-town area          -> town:<area>[#N]           (whole area shares; 32/channel)
 //   PATH/DUNGEON, in a party  -> party:<partyId>:<mapName>
 //   PATH/DUNGEON, solo        -> solo:<username>:<mapName>
 //
@@ -14,16 +14,22 @@ const { isValidEntityId } = require('./validate');
 
 const AREA_TOWN = 0;
 
-// Only these areas are *shared* towns (open matchmaking). Per the user's design
-// we started with just Rookie Harbor; Rhombus Square (罗姆布斯广场, incl. 迎新桥)
-// is now shared too. A TOWN-area map not in this list is treated as a normal
-// party/solo map.
+// Main-city (主城) areas: the WHOLE area is one open-matchmaking town, not just a
+// single sub-map. Players in these areas auto-match (no party required) into a
+// town instance. A TOWN-area map not in this list stays a normal party/solo map.
+//   rookie-harbor = 新手港 (Rookie Harbor)
+//   rhombus-sqr   = 罗姆斯广场 (Rhombus Square, incl. 迎新桥)
 const SHARED_TOWNS = ['rookie-harbor', 'rhombus-sqr'];
 
-function isSharedTown(mapName, areaType) {
-	if (areaType !== AREA_TOWN) return false;
+// Max players in one main-city instance (channel). A full channel forces the next
+// joiner into a new `town:<area>#N` channel (like MMO channels).
+const TOWN_CAPACITY = 32;
+
+/** The main-city AREA a map belongs to, or null (not a shared town). */
+function sharedTownArea(mapName, areaType) {
+	if (areaType !== AREA_TOWN) return null;
 	const area = mapName.indexOf('.') === -1 ? mapName : mapName.substring(0, mapName.indexOf('.'));
-	return SHARED_TOWNS.indexOf(area) !== -1;
+	return SHARED_TOWNS.indexOf(area) !== -1 ? area : null;
 }
 
 function World() {
@@ -38,6 +44,13 @@ function World() {
 	this.userIsolation = Object.create(null);
 }
 
+// True when `instanceId` is a town instance of the given AREA (any channel).
+World.prototype.isTownInstanceOfArea = function (instanceId, area) {
+	if (typeof instanceId !== 'string') return false;
+	const prefix = 'town:' + area;
+	return instanceId === prefix || instanceId.indexOf(prefix + '#') === 0;
+};
+
 // Compute the instance a player should join for a given map.
 World.prototype.instanceIdFor = function (username, mapName, areaType) {
 	// Round 19: PVP-duel isolation OVERRIDES every routing rule. While isolated,
@@ -47,8 +60,20 @@ World.prototype.instanceIdFor = function (username, mapName, areaType) {
 	if (this.userIsolation[username]) {
 		return 'solo:' + username + ':' + mapName;
 	}
-	if (isSharedTown(mapName, areaType)) {
-		return 'town:' + mapName;
+	const townArea = sharedTownArea(mapName, areaType);
+	if (townArea) {
+		// Stay in the town channel we're already in (a re-sync or a move between two
+		// sub-maps of the same area must never hop channels).
+		const cur = this.userInstance[username];
+		if (cur && this.isTownInstanceOfArea(cur, townArea)) return cur;
+		// Otherwise join the first channel with room; a full channel spills into a
+		// new `town:<area>#N` channel.
+		for (let channel = 0; channel < 1000; channel++) {
+			const id = channel === 0 ? ('town:' + townArea) : ('town:' + townArea + '#' + channel);
+			const inst = this.instances[id];
+			if (!inst || inst.members.length < TOWN_CAPACITY) return id;
+		}
+		return 'town:' + townArea + '#999'; // unreachable safety net
 	}
 	const partyId = party.partyOf(username);
 	if (partyId) {
@@ -91,7 +116,9 @@ World.prototype.getMemberLocation = function (username) {
 	const instanceId = this.userInstance[username];
 	const inst = instanceId && this.instances[instanceId];
 	if (!inst) return null;
-	return { map: inst.mapName, pos: (inst.memberPos && inst.memberPos[username]) || null };
+	// A town instance spans a whole area; use the member's REAL sub-map when known.
+	const map = (inst.memberMap && inst.memberMap[username]) || inst.mapName;
+	return { map, pos: (inst.memberPos && inst.memberPos[username]) || null };
 };
 
 // After a party disbands (or FORMS), members still standing in an instance that
@@ -123,9 +150,24 @@ World.prototype.changeMap = function (ctx, username, mapName, areaType, pos) {
 	if (this.userInstance[username] === instanceId) {
 		const cur = this.instances[instanceId];
 		if (cur) {
+			const prevMap = (cur.memberMap && cur.memberMap[username]) || null;
 			if (cur.memberPos) cur.memberPos[username] = pos;
+			if (!cur.memberMap) cur.memberMap = Object.create(null);
+			cur.memberMap[username] = mapName;
+			// A member moved to a DIFFERENT sub-map of the same town area (still the
+			// same instance): tell the other members it left the old map and entered the
+			// new one, so their clients spawn the mirror only for the sub-map they share.
+			if (prevMap && prevMap !== mapName) {
+				for (const other of cur.members) {
+					if (other === username) continue;
+					const sock = ctx.getSocket(other);
+					if (!sock) continue;
+					sock.emit('onPlayerChangeMap', { player: username, enters: false, map: prevMap, marker: null });
+					sock.emit('onPlayerChangeMap', { player: username, enters: true, position: pos, map: mapName, marker: null });
+				}
+			}
 			const members = cur.members.filter((m) => m !== username)
-				.map((m) => ({ name: m, pos: cur.memberPos ? cur.memberPos[m] : undefined }));
+				.map((m) => ({ name: m, pos: cur.memberPos ? cur.memberPos[m] : undefined, map: (cur.memberMap && cur.memberMap[m]) || cur.mapName }));
 			// Round 20: a re-sync is still an instance (re)join — re-push the party's
 			// opened-chest snapshot for this map so a party formed/rejoined here is
 			// immediately ghost-aware.
@@ -140,6 +182,7 @@ World.prototype.changeMap = function (ctx, username, mapName, areaType, pos) {
 	if (!inst) {
 		inst = this.instances[instanceId] = {
 			id: instanceId, mapName, areaType, host: null, members: [], entities: Object.create(null),
+			memberMap: Object.create(null),
 		};
 	}
 
@@ -167,15 +210,17 @@ World.prototype.changeMap = function (ctx, username, mapName, areaType, pos) {
 	for (const other of inst.members) {
 		const sock = ctx.getSocket(other);
 		if (!sock) continue;
-		members.push({ name: other, pos: inst.memberPos ? inst.memberPos[other] : undefined });
+		members.push({ name: other, pos: inst.memberPos ? inst.memberPos[other] : undefined, map: (inst.memberMap && inst.memberMap[other]) || inst.mapName });
 		sock.emit('onPlayerChangeMap', { player: username, enters: true, position: pos, map: mapName, marker: null });
-		ctx.getSocket(username).emit('onPlayerChangeMap', { player: other, enters: true, position: (inst.memberPos && inst.memberPos[other]), map: mapName, marker: null });
+		ctx.getSocket(username).emit('onPlayerChangeMap', { player: other, enters: true, position: (inst.memberPos && inst.memberPos[other]), map: (inst.memberMap && inst.memberMap[other]) || inst.mapName, marker: null });
 	}
 
 	inst.members.push(username);
 	this.userInstance[username] = instanceId;
 	if (!inst.memberPos) inst.memberPos = {};
 	inst.memberPos[username] = pos;
+	if (!inst.memberMap) inst.memberMap = Object.create(null);
+	inst.memberMap[username] = mapName;
 
 	// Replay this instance's entity bucket to the newcomer so they see enemies.
 	if (!isHost) {
@@ -220,6 +265,7 @@ World.prototype.leaveCurrentInstance = function (ctx, username) {
 	inst.members = inst.members.filter((m) => m !== username);
 	if (inst.memberPos) delete inst.memberPos[username];
 	if (inst.memberProfiles) delete inst.memberProfiles[username];
+	if (inst.memberMap) delete inst.memberMap[username];
 
 	// Tell remaining members this player left.
 	for (const other of inst.members) {
@@ -235,7 +281,10 @@ World.prototype.leaveCurrentInstance = function (ctx, username) {
 			inst.host = next;
 			const sock = ctx.getSocket(next);
 			if (sock) {
-				sock.emit('setHost', { isHost: true, map: inst.mapName });
+				// Main-city refactor: a town instance spans a whole area, so the new host
+				// may be on a DIFFERENT sub-map than the instance's first joiner. Tag the
+				// setHost with the NEW host's own sub-map so its client's map-check accepts it.
+				sock.emit('setHost', { isHost: true, map: (inst.memberMap && inst.memberMap[next]) || inst.mapName });
 				console.log('[world] instance ' + instanceId + ' host migrated to ' + next);
 			}
 		}

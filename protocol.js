@@ -812,6 +812,17 @@ function handleConnection(socket) {
 		// clients omit these -> neutral/non-crit defaults (behaviour unchanged).
 		let attackElement = Number(data.attackElement);
 		if (!isFinite(attackElement) || attackElement < 0 || attackElement > 4) attackElement = 0;
+		// ROUND 72 (number style sync): the attacker also forwards the FINAL number
+		// style its engine produced — shield result (silver GUARD), element-weakness
+		// flag, offensive/defensive factors (number size + STRONG/WEAK appendix) — so
+		// every spectator pops the identical styled number on its own puppet, and the
+		// host can force the rolled crit. Old clients omit these -> plain defaults.
+		let shield = Number(data.shield);
+		if (!isFinite(shield) || shield < 0 || shield > 3) shield = 0;
+		let off = Number(data.off);
+		if (!isFinite(off) || off <= 0 || off > 10) off = 1;
+		let def = Number(data.def);
+		if (!isFinite(def) || def <= 0 || def > 10) def = 1;
 		world.broadcastToInstance(ctx, username, 'enemyDamage', {
 			uid: data.uid,
 			damage: Math.round(dmg),
@@ -822,6 +833,10 @@ function handleConnection(socket) {
 			knockback: knockback,
 			attackElement: Math.round(attackElement),
 			critical: data.critical === true,
+			shield: Math.round(shield),
+			weak: data.weak === true,
+			off: off,
+			def: def,
 		});
 	});
 
@@ -877,10 +892,24 @@ function handleConnection(socket) {
 		let attackElement = Number(data.attackElement);
 		if (!isFinite(attackElement) || attackElement < 0 || attackElement > 4) attackElement = 0;
 		const attacker = (typeof data.attacker === 'string' && data.attacker && data.attacker.length <= 64) ? data.attacker : undefined;
+		// ROUND 72 (host-hit number sync): the host's OWN native hits now ride this
+		// channel too, carrying the FINAL styled result ({damage, shield, weak, off,
+		// def}, NO attacker stamp) so members pop the identical number on their
+		// puppets. Member-originated relays keep {attacker} and no damage — cosmetic
+		// FX only. Damage is optional: absent -> legacy FX-only behaviour.
+		let hurtDmg = Number(data.damage);
+		if (!isFinite(hurtDmg) || hurtDmg <= 0 || hurtDmg > 100000) hurtDmg = undefined;
+		let shield = Number(data.shield);
+		if (!isFinite(shield) || shield < 0 || shield > 3) shield = 0;
+		let off = Number(data.off);
+		if (!isFinite(off) || off <= 0 || off > 10) off = 1;
+		let def = Number(data.def);
+		if (!isFinite(def) || def <= 0 || def > 10) def = 1;
 		world.broadcastHostState(ctx, username, 'enemyHurt', {
 			uid: data.uid, type: Math.round(type),
 			attackElement: Math.round(attackElement), critical: data.critical === true,
 			...(attacker !== undefined ? { attacker } : {}),
+			...(hurtDmg !== undefined ? { damage: Math.round(hurtDmg), shield: Math.round(shield), weak: data.weak === true, off: off, def: def } : {}),
 		});
 	});
 

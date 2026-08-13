@@ -1,0 +1,14 @@
+[config] multiplayer mod v1.63.0 | monsterHpPerPlayer = 0.5 (monsters gain +50% max HP per extra party member) | saveUploadKbS = 1024 | saveDownloadKbS = 200 | port = 15151
+[server] multiplayer server v1.63.0 listening on *:15156
+[accounts] registered new account: cdpA
+[protocol] cdpA logged in (v1.63.0) (new account)
+[protocol] cdpA starts from the default save (罗姆布斯广场-迎新桥)
+[accounts] registered new account: cdpB
+[protocol] cdpB logged in (v1.63.0) (new account)
+[protocol] cdpB starts from the default save (罗姆布斯广场-迎新桥)
+[world] instance unloaded (empty): solo:cdpA:hideout.entrance
+[world] instance unloaded (empty): solo:cdpB:hideout.entrance
+[protocol] cdpA disconnected
+[world] instance unloaded (empty): solo:cdpA:rhombus-sqr.central
+[protocol] cdpB disconnected
+[world] instance unloaded (empty): solo:cdpB:rhombus-sqr.central
