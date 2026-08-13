@@ -480,6 +480,38 @@ function handleConnection(socket) {
 		world.broadcastHostState(ctx, username, 'entityState', { map: block.map, e: block.e, cb: !!block.cb, f });
 	});
 
+	// ---- round 62: host streams enemy PROJECTILES so members see ranged attacks ----
+	// The instance host runs the real enemy AI, so only it spawns enemy projectiles
+	// (ig.ENTITY.Ball / ig.ENTITY.Stone with party ENEMY). Members' puppets run no AI and
+	// never spawn them, so the host relays each live enemy projectile's uid/kind/source/
+	// proxy-name/pos/vel here and every member spawns a VISUAL-ONLY copy (no local hit or
+	// damage — the host already computes projectile damage and forwards it via combatHit).
+	// Host-only like entityState (broadcastHostState no-ops unless the sender IS the
+	// instance host), auth-gated + rate-limited; the payload is whitelisted field-by-field
+	// (never a raw blob).
+	socket.on('projectileState', function (block) {
+		if (dropIfNotAuthed('projectileState')) return;
+		// Max legit rate = the host's 怪物同步频率 (30/60Hz); 90/s leaves jitter headroom
+		// while still capping floods. (The sibling entityState stream is unlimited.)
+		if (rateLimited('projectileState', 90)) return;
+		if (!block || typeof block.map !== 'string' || !Array.isArray(block.e)) return;
+		if (block.e.length > 128) return; // projectiles are short-lived; the cap is generous
+		const num = (v) => (typeof v === 'number' && isFinite(v)) ? Math.round(v) : 0;
+		const list = [];
+		for (const e of block.e) {
+			if (!e || typeof e !== 'object' || typeof e.i !== 'number') continue;
+			list.push({
+				i: num(e.i),
+				k: e.k === 'S' ? 'S' : 'B',           // Stone vs Ball (both are Projectile)
+				src: num(e.src),                       // source enemy uid (0 = unknown)
+				pn: (typeof e.pn === 'string' && e.pn.length <= 64) ? e.pn : '', // proxy name
+				x: num(e.x), y: num(e.y), z: num(e.z),
+				vx: num(e.vx), vy: num(e.vy),          // 2D velocity (flight angle only)
+			});
+		}
+		world.broadcastHostState(ctx, username, 'projectileState', { map: block.map, e: list });
+	});
+
 	// ---- round 19: cutscene-spawned monster sync (NON-host streaming) ----
 	// During a cutscene the game can spawn monsters the client wants the whole
 	// instance to see as temporary entities. Like playerState this is NOT

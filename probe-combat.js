@@ -2,6 +2,10 @@
 // Run: node probe-combat.js
 const { io } = require('socket.io-client');
 const URL = 'http://127.0.0.1:1423';
+// Round 17 version gate: the server rejects any handshake whose version
+// differs from config.js MOD_VERSION. Pull it from the same config module so
+// this probe never drifts out of sync on a version bump.
+const VERSION = require('./config').version;
 
 function log(name, msg) { console.log('[' + new Date().toISOString().slice(11, 19) + '] ' + name + ': ' + msg); }
 
@@ -12,7 +16,7 @@ function connect(name) {
 	return new Promise((resolve, reject) => {
 		const s = io(URL, { transports: ['websocket'], reconnection: false });
 		const p = { s, name, events: [] };
-		s.on('connect', () => s.emit('handshake', { username: name }));
+		s.on('connect', () => s.emit('handshake', { username: name, version: VERSION }));
 		s.on('handshakeResponse', (d) => {
 			log(name, 'handshake ' + JSON.stringify(d).slice(0, 120));
 			if (d.failed) reject(new Error(name + ' handshake failed: ' + d.failed));
