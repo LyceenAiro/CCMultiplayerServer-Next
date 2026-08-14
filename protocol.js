@@ -874,6 +874,20 @@ function handleConnection(socket) {
 		world.broadcastToInstance(ctx, username, 'combatFx', { from: username, uid: data.uid, kind: data.kind });
 	});
 
+	// ---- ROUND 74: plant destruct sync ----
+	// Any instance client destroyed a map destructible (plant/bush/stone). Every OTHER
+	// same-instance client destroys its own intact copy at the same mapId (the map data
+	// is identical for everyone, so mapId unambiguously identifies the plant). Payload is
+	// whitelisted field-by-field; the map string is bounded, never trusted. Solo players
+	// never send this (the client's syncEmit skips solo instances).
+	socket.on('plantBreak', function (data) {
+		if (dropIfNotAuthed('plantBreak')) return;
+		if (rateLimited('plantBreak', 20)) return;
+		if (!data || typeof data.mapId !== 'number' || !Number.isInteger(data.mapId) || data.mapId <= 0) return;
+		if (typeof data.map !== 'string' || data.map.length === 0 || data.map.length > 128) return;
+		world.broadcastToInstance(ctx, username, 'plantBreak', { map: data.map, mapId: data.mapId });
+	});
+
 	// ---- round 45 (Gap A, host origin): the HOST applied a member's forwarded hit to a
 	// real enemy. The server self-drops enemyDamage back to that member, so any OTHER member
 	// spectating heard nothing. The host relays a cosmetic-only notice (NO damage here — HP
