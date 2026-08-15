@@ -3,7 +3,7 @@
 	"version": "0.1.0",
 	"description": "Relay server for the CrossCode multiplayer mod (CCMultiplayerClient).",
 	"license": "MIT",
-	"author": "CCDirectLink",
+	"author": "CCDirectLink, LyceenAiro",
 	"main": "server.js",
 	"scripts": {
 		"start": "node server.js"

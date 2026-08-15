@@ -60,6 +60,14 @@ app.get(['^/data/*', '^/media/*'], function(req, res){
 	res.sendFile(file);
 });
 
+// ROUND 79 (server-list version): the client's server browser probes this endpoint
+// to show each server card's mod version (the SAME config.version the login
+// handshake reports). CORS-open, tiny, no auth - the version is public information.
+app.get('/version', function(req, res){
+	res.set({'Access-Control-Allow-Origin': '*'});
+	res.json({ version: config.version });
+});
+
 app.get(/^(?!(\/media\/|\/data\/))/g, function(req, res){
 	res.status(404).end();
 });
