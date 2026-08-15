@@ -1446,6 +1446,9 @@ function handleConnection(socket) {
 			}
 		}
 		party.addMember(partyId, username);
+		// ROUND 96: tell the ACCEPTOR themselves they joined (the roster-diff toast
+		// path only announces OTHER members; self transitions were silent).
+		socket.emit('partySelfEvent', { event: 'join' });
 		// Broadcast the new roster to EVERY member (inviter + invitee).
 		pushPartyUpdate(partyId);
 		const p = party.getParty(partyId);
@@ -1534,6 +1537,7 @@ function handleConnection(socket) {
 		const partyId = party.partyOf(username);
 		const others = partyId && party.getParty(partyId) ? party.getParty(partyId).members.filter((m) => m !== username) : [];
 		const updated = party.removeMember(username);
+		socket.emit('partySelfEvent', { event: 'leave' });
 		socket.emit('partyUpdate', null);
 		if (updated) {
 			// Round 23 wave 3: the leaver's manner rides the roster broadcast.
@@ -1671,7 +1675,10 @@ function handleConnection(socket) {
 		const updated = party.removeMember(target);
 		// The kicked player loses their party exactly like a leave.
 		const tSock = accounts.getSocket(target);
-		if (tSock) tSock.emit('partyUpdate', null);
+		if (tSock) {
+			tSock.emit('partySelfEvent', { event: 'kicked' });
+			tSock.emit('partyUpdate', null);
+		}
 		if (updated) {
 			// Round 23 wave 3: the kicked member's manner rides the roster broadcast.
 			pushPartyUpdate(updated.id, { name: target, reason: 'kicked' });
