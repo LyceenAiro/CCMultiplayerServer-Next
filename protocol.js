@@ -1657,32 +1657,70 @@ function handleConnection(socket) {
 		}
 	});
 
-	// ---- round 23 wave 4: PARTY CHAT ----
-	// Party-only chat relay. The sender must be in a party; the message is
-	// delivered to every OTHER party member whose socket is authed AND currently
-	// in the SAME map instance as the sender (a member on another map/instance
-	// must not receive it — chat follows what you can actually see). The sender
-	// never receives an echo; the client renders its own message locally.
-	// Rate-limited (2/s per socket — plenty for human typing, stops a flood).
+	// ---- round 23 wave 4 + ROUND 93: WORLD / PARTY / PRIVATE CHAT ----
+	// One `chat` event now routes by `channel`:
+	//   world   — relayed to EVERY authed online player on the server (global
+	//             world channel, 1/s per socket so one player can't spam the room).
+	//   party   — relayed to every OTHER party member REGARDLESS of map/instance
+	//             (team chat is a private line, not proximity chat).
+	//   private — relayed to exactly one named online player (direct message).
+	// The sender never receives an echo; each client renders its own message
+	// locally. Invalid/unroutable sends get a `chatError` back to the SENDER so
+	// the new bottom-left chat panel can show a system line instead of failing
+	// silently.
 	socket.on('chat', function (data) {
 		if (dropIfNotAuthed('chat')) return;
-		if (rateLimited('chat', 2)) return;
 		if (!data || typeof data.text !== 'string') return;
 		const text = data.text.trim();
 		if (text.length < 1 || text.length > 200) return;
-		const partyId = party.partyOf(username);
-		if (!partyId) return; // party-only: solo senders have nobody to reach
-		const p = party.getParty(partyId);
-		if (!p) return;
-		const senderInstanceId = world.instanceOf(username);
-		if (!senderInstanceId) return;
-		for (const m of p.members) {
-			if (m === username) continue; // no echo to the sender
-			if (!accounts.isOnline(m)) continue; // authed + connected
-			if (world.instanceOf(m) !== senderInstanceId) continue; // same instance only
-			const s = accounts.getSocket(m);
-			if (s) s.emit('chat', { from: username, text });
+		// Backwards-compatible default for a pre-channel client: party.
+		const channel = data.channel === 'world' || data.channel === 'party' || data.channel === 'private'
+			? data.channel : 'party';
+		// World chat is a global amplifier: keep it at 1/s; party/private stay at
+		// the old 2/s (plenty for human typing, stops a flood).
+		const maxPerSec = channel === 'world' ? 1 : 2;
+		if (rateLimited('chat.' + channel, maxPerSec)) {
+			socket.emit('chatError', { reason: 'rate', channel });
+			return;
 		}
+
+		if (channel === 'world') {
+			for (const name of accounts.onlineNames()) {
+				if (name === username) continue; // no echo to the sender
+				const s = accounts.getSocket(name);
+				if (s) s.emit('chat', { from: username, text, channel: 'world' });
+			}
+			return;
+		}
+
+		if (channel === 'party') {
+			const partyId = party.partyOf(username);
+			const p = partyId && party.getParty(partyId);
+			if (!p || p.members.length <= 1) {
+				socket.emit('chatError', { reason: 'notInParty', channel: 'party' });
+				return;
+			}
+			for (const m of p.members) {
+				if (m === username) continue; // no echo to the sender
+				if (!accounts.isOnline(m)) continue; // authed + connected
+				const s = accounts.getSocket(m);
+				if (s) s.emit('chat', { from: username, text, channel: 'party' });
+			}
+			return;
+		}
+
+		// private
+		const target = typeof data.target === 'string' ? data.target : '';
+		if (!isValidName(target) || target === username) {
+			socket.emit('chatError', { reason: 'invalidTarget', channel: 'private' });
+			return;
+		}
+		const targetSocket = accounts.getSocket(target);
+		if (!targetSocket) {
+			socket.emit('chatError', { reason: 'offline', channel: 'private', target });
+			return;
+		}
+		targetSocket.emit('chat', { from: username, text, channel: 'private' });
 	});
 
 	// ---- server-side save ----
