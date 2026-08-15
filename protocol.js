@@ -474,6 +474,25 @@ function handleConnection(socket) {
 			ggt: (typeof s.ggt === 'number') ? s.ggt : undefined,
 		});
 	});
+	// ---- round 82: door-open visual sync ----
+	// When a player walks into a mapped door their client broadcasts the door so the
+	// other members on the same map can open their local copy and watch the remote
+	// player's enter/exit walk instead of seeing them pass through a closed door /
+	// pop out. Instance-scoped, auth-gated, field-whitelisted, heavily rate-limited.
+	socket.on('doorTransition', function (data) {
+		if (dropIfNotAuthed('doorTransition')) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 128) return;
+		if (rateLimited('doorTransition', 4)) return;
+		const num = (v) => (typeof v === 'number' && isFinite(v)) ? Math.round(v) : 0;
+		const dir = (data.dir === 'NORTH' || data.dir === 'SOUTH' || data.dir === 'EAST' || data.dir === 'WEST') ? data.dir : 'SOUTH';
+		world.broadcastToInstance(ctx, username, 'doorTransition', {
+			map: data.map,
+			x: num(data.x), y: num(data.y), z: num(data.z),
+			dir,
+			targetMap: (typeof data.targetMap === 'string' && data.targetMap.length <= 128) ? data.targetMap : '',
+			marker: (typeof data.marker === 'string' && data.marker.length <= 64) ? data.marker : '',
+		});
+	});
 	// Only the instance host broadcasts the entity (enemy) state block. Keyed by the
 	// map's stable mapId so host & members refer to the same creature. Members apply
 	// it to puppet mirrors (their local enemy AI is disabled).
