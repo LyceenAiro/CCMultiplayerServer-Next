@@ -464,6 +464,13 @@ function handleConnection(socket) {
 			gm: (typeof s.gm === 'number') ? s.gm : undefined,
 			ga: (typeof s.ga === 'number') ? s.ga : undefined,
 			def: (typeof s.def === 'number') ? s.def : undefined,
+			// ROUND 79: member element factors / params damageFactor / focus - the host's
+			// damage recompute reads these (engine g factor + the crit roll). ef is a
+			// bounded 4-number array; df/fc plain finite numbers. Relay as-is so the
+			// receiver's presence-guard cache keeps working.
+			ef: (Array.isArray(s.ef) && s.ef.length <= 4) ? s.ef.map(function (v) { return typeof v === 'number' && isFinite(v) ? v : 1; }) : undefined,
+			df: (typeof s.df === 'number' && isFinite(s.df)) ? s.df : undefined,
+			fc: (typeof s.fc === 'number' && isFinite(s.fc)) ? s.fc : undefined,
 			ggt: (typeof s.ggt === 'number') ? s.ggt : undefined,
 		});
 	});
@@ -751,6 +758,12 @@ function handleConnection(socket) {
 			// MASSIVE), relayed from hitProps.visualType so the member plays the correct
 			// hit sound (a hardcoded LIGHT made every melee hit sound like a ball-hit).
 			attackType: typeof data.attackType === 'number' && isFinite(data.attackType) && data.attackType > 0 ? data.attackType : undefined,
+			// ROUND 79: guard-bar drain (engine's ratio^1.5 value, NOT the HP chip) and the
+			// FULL unguarded hit for the bar-break case. The host's recompute emits both on
+			// regular-guard verdicts; the member's applyCombatHit feeds the bar with
+			// shieldDmg and falls back to the full hit when the bar breaks.
+			shieldDmg: (typeof data.shieldDmg === 'number' && isFinite(data.shieldDmg) && data.shieldDmg >= 0) ? Math.round(data.shieldDmg) : undefined,
+			full: (typeof data.full === 'number' && isFinite(data.full) && data.full > 0) ? Math.round(data.full) : undefined,
 			// ROUND 43 (enemy-hurt sound for teammates): the attacker's ATTACK ELEMENT,
 			// forwarded from the member's local hit so every spectator can re-run
 			// showHitEffect on the enemy PUPPET (the host's puppet-onDamage is silent,
