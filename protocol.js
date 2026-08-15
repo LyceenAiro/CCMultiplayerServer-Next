@@ -146,6 +146,15 @@ function handleConnection(socket) {
 				if (v !== undefined) out.equip[s] = Math.round(v);
 			}
 		}
+		// ROUND 91: four non-neutral element factors for the quick-menu resistance
+		// readout. Invalid/missing entries become 1 (neutral damage) — never null.
+		if (Array.isArray(p.elemFactor)) {
+			out.elemFactor = [];
+			for (let i = 0; i < 4; i++) {
+				const v = num(p.elemFactor[i]);
+				out.elemFactor[i] = v !== undefined ? v : 1;
+			}
+		}
 		return out;
 	}
 
