@@ -19,7 +19,11 @@ const AREA_TOWN = 0;
 // town instance. A TOWN-area map not in this list stays a normal party/solo map.
 //   rookie-harbor = 新手港 (Rookie Harbor)
 //   rhombus-sqr   = 罗姆斯广场 (Rhombus Square, incl. 迎新桥)
-const SHARED_TOWNS = ['rookie-harbor', 'rhombus-sqr'];
+//   bergen        = 俾尔根村 (Bergen Village)
+//   ba-ki-kum     = 巴基库姆 (Ba'kii Kum)
+//   basin-keep    = 巴辛堡 (Basin Keep)
+//   homestedt     = 家园 (Homestedt)
+const SHARED_TOWNS = ['rookie-harbor', 'rhombus-sqr', 'bergen', 'ba-ki-kum', 'basin-keep', 'homestedt'];
 
 // Max players in one main-city instance (channel). A full channel forces the next
 // joiner into a new `town:<area>#N` channel (like MMO channels).
