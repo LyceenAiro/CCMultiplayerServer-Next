@@ -698,6 +698,19 @@ function handleConnection(socket) {
 		world.broadcastToInstance(ctx, username, 'itemUse', { player: username, item });
 	});
 
+	// ---- ROUND 99: HEAL NUMBER relay ----
+	// The HEALING player's own client already shows the green +N jump-numbers
+	// (Combatant.heal -> ig.ENTITY.HitNumber.spawnHealingNumber). Relay the healed
+	// amount to every OTHER same-instance player so spectators can spawn the same
+	// green number above that player's mirror.
+	socket.on('playerHeal', function (data) {
+		if (dropIfNotAuthed('playerHeal')) return;
+		if (rateLimited('playerHeal', 20)) return;
+		const amount = Number(data && data.amount);
+		if (!isFinite(amount) || amount <= 0 || amount > 999999) return;
+		world.broadcastToInstance(ctx, username, 'playerHeal', { player: username, amount: Math.round(amount) });
+	});
+
 	// ---- round 23: host grants credits/items to members when it kills a monster ----
 	// The instance host's death chain (EnemyType.resolveDefeat) grants credits + item
 	// drops to the HOST's player. The host relays them here so every member's client
