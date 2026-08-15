@@ -190,6 +190,16 @@ function handleConnection(socket) {
 		}
 	}
 
+	// ROUND 95: a 2-person party DISBANDS into partyUpdate null, which carries no
+	// roster diff for the survivor — so the survivor never got a join/leave toast.
+	// This dedicated departure event rides alongside the null in every disband path
+	// (leave / kick / accept-elsewhere / disconnect) so the survivor can toast it.
+	function pushPartyMemberLeft(socket, name, reason) {
+		if (!socket || typeof name !== 'string' || !name) return;
+		const r = reason === 'kicked' || reason === 'disconnected' ? reason : 'left';
+		socket.emit('partyMemberLeft', { name, reason: r });
+	}
+
 	// ---- round 23: paced save DOWNLOAD (handshakeResponse no longer carries save) ----
 	// The client expects its save as a stream of `saveDownload` parts right after the
 	// handshake: 8192-char chunks paced at config.saveDownloadKbS (default 200 kb/s,
@@ -361,7 +371,10 @@ function handleConnection(socket) {
 			// now the host there, or their world goes empty (they were the member).
 			for (const m of survivors) {
 				const s = accounts.getSocket(m);
-				if (s) s.emit('partyUpdate', null);
+				if (s) {
+					pushPartyMemberLeft(s, name, 'disconnected');
+					s.emit('partyUpdate', null);
+				}
 				const res = world.recomputeMemberInstance(ctx, m);
 				if (res && res.isHost && s) s.emit('setHost', { isHost: true, map: res.mapName });
 			}
@@ -669,6 +682,20 @@ function handleConnection(socket) {
 		if (dropIfNotAuthed('soundStop')) return;
 		if (rateLimited('soundStop', 60)) return;
 		world.broadcastToInstance(ctx, username, 'soundStop', { player: username });
+	});
+
+	// ---- ROUND 95: ITEM-USE INDICATOR ----
+	// A player consumed/used an item. Relay the item id to every OTHER player in
+	// the same instance so they can pop the item icon above that player's head.
+	// Item ids are string|number in the engine — validate both shapes; no raw blob.
+	socket.on('itemUse', function (data) {
+		if (dropIfNotAuthed('itemUse')) return;
+		if (rateLimited('itemUse', 10)) return;
+		const item = data && data.item;
+		const valid = (typeof item === 'string' && item.length > 0 && item.length <= 80)
+			|| (typeof item === 'number' && isFinite(item));
+		if (!valid) return;
+		world.broadcastToInstance(ctx, username, 'itemUse', { player: username, item });
 	});
 
 	// ---- round 23: host grants credits/items to members when it kills a monster ----
@@ -1349,7 +1376,12 @@ function handleConnection(socket) {
 			socket.emit('partyActionResult', { action: 'invite', ok: false, error: 'busy' });
 			return;
 		}
+		const hadParty = !!party.partyOf(username);
 		const partyId = party.createParty(username);
+		// ROUND 95: push the freshly-created solo party back to the inviter. Without
+		// this, their first-ever roster snapshot is the post-accept [inviter, invitee],
+		// so the prev roster is EMPTY and the "X joined the party" toast is skipped.
+		if (!hadParty) pushPartyUpdate(partyId);
 		// Round 23 review: never invite someone who is ALREADY a member of this
 		// party (createParty returns the inviter's existing party). Reject with the
 		// same partyActionResult error shape as the busy-check. The client doesn't
@@ -1404,7 +1436,10 @@ function handleConnection(socket) {
 		} else {
 			for (const m of prevSurvivors) {
 				const s = accounts.getSocket(m);
-				if (s) s.emit('partyUpdate', null);
+				if (s) {
+					pushPartyMemberLeft(s, username, 'left');
+					s.emit('partyUpdate', null);
+				}
 				// The old party disbanded: move its survivor out of the dead
 				// party:<id> instance so they don't linger as a ghost.
 				world.recomputeMemberInstance(ctx, m);
@@ -1507,7 +1542,10 @@ function handleConnection(socket) {
 			// Party disbanded (2-person party lost a member) -> tell the survivor too.
 			for (const m of others) {
 				const s = accounts.getSocket(m);
-				if (s) s.emit('partyUpdate', null);
+				if (s) {
+					pushPartyMemberLeft(s, username, 'left');
+					s.emit('partyUpdate', null);
+				}
 				world.recomputeMemberInstance(ctx, m);
 			}
 		}
@@ -1640,10 +1678,14 @@ function handleConnection(socket) {
 		} else {
 			// Party disbanded (kick dropped it to one person): tell the kicker and
 			// any survivors their party is gone too.
+			pushPartyMemberLeft(socket, target, 'kicked');
 			socket.emit('partyUpdate', null);
 			for (const m of others) {
 				const s = accounts.getSocket(m);
-				if (s) s.emit('partyUpdate', null);
+				if (s) {
+					pushPartyMemberLeft(s, target, 'kicked');
+					s.emit('partyUpdate', null);
+				}
 				world.recomputeMemberInstance(ctx, m);
 			}
 		}
