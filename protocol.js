@@ -226,6 +226,10 @@ function handleConnection(socket) {
 			socket.emit('handshakeResponse', {
 				success: false,
 				message: '版本不一致 Version mismatch: server=' + config.version + ' client=' + (clientVersion || '?'),
+				// ROUND 86: structured server version so the client can detect
+				// "server updated" specifically (vs any other login rejection) and
+				// show the styled update popup instead of reconnect-forever.
+				version: config.version,
 			});
 			return;
 		}
