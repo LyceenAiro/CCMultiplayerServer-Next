@@ -1064,6 +1064,17 @@ function handleConnection(socket) {
 		if (!clean) return;
 		world.updateMemberProfile(username, clean);
 		world.broadcastToInstance(ctx, username, 'updatePlayerProfile', { player: username, profile: clean });
+		// ROUND 89 (offline search level): persist the sanitized profile on the
+		// ACCOUNT so an offline friend's level/stats survive logout and server
+		// restarts. updatePlayerProfile is event-driven (connect / real stat
+		// changes), so this writes are rare, not per-frame.
+		try {
+			const account = accounts.getAccount(username);
+			if (account) {
+				account.profile = clean;
+				persistence.save();
+			}
+		} catch (e) { /* non-fatal */ }
 	});
 	socket.on('killEntity', function (data) {
 		if (dropIfNotAuthed('killEntity')) return;
@@ -1203,14 +1214,19 @@ function handleConnection(socket) {
 		if (dropIfNotAuthed('friendList')) return;
 		const list = friends.list(username);
 		socket.emit('friendList', { friends: list });
-		// Push cached real profiles for online friends right away so the Social
-		// info box shows level/stats/equip on FIRST open (not after a 3s pump or a
-		// shared-map visit). Friends never met in-game have no instance cache, so
-		// use the global account profile cache.
+		// Push cached real profiles right away so the Social info box shows
+		// level/stats/equip on FIRST open (not after a 3s pump or a shared-map
+		// visit). Live friends use the global session cache; OFFLINE friends now
+		// fall back to the profile persisted on their account (ROUND 89), so their
+		// level stays visible in the friend list / add-friend search too.
 		try {
 			for (const f of list) {
-				if (!f || !f.online) continue;
-				const prof = world.getAccountProfile(f.name);
+				if (!f) continue;
+				let prof = world.getAccountProfile(f.name);
+				if (!prof) {
+					const acc = accounts.getAccount(f.name);
+					prof = acc && acc.profile;
+				}
 				if (prof) socket.emit('updatePlayerProfile', { player: f.name, profile: prof });
 			}
 		} catch (e) { /* non-fatal */ }
@@ -1223,8 +1239,9 @@ function handleConnection(socket) {
 	// ---- round 23 wave 3: player SEARCH (the search-first add-friend flow) ----
 	// Reply ONLY to the requester: a capped list of exact/prefix/substring matches
 	// against every KNOWN account (username is identity; persistence.db.accounts is
-	// the source of truth). Level is NOT persisted — it's live in world's profile
-	// cache (updatePlayerProfile), so we carry it when known and omit it otherwise.
+	// the source of truth). Level comes from the live profile cache when the player
+	// is online, and from the profile persisted on the account (ROUND 89) when they
+	// are offline.
 	socket.on('searchPlayers', function (data) {
 		if (dropIfNotAuthed('searchPlayers')) return;
 		if (rateLimited('searchPlayers', 2)) return;
@@ -1260,7 +1277,12 @@ function handleConnection(socket) {
 				}
 			}
 			if (rank < 0) continue;
-			const prof = world.getAccountProfile(name);
+			let prof = world.getAccountProfile(name);
+			if (!prof) {
+				// ROUND 89: offline accounts keep their last sanitized profile.
+				const acc = accounts.getAccount(name);
+				prof = acc && acc.profile;
+			}
 			scored.push({
 				name,
 				rank,
