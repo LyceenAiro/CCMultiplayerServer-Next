@@ -483,8 +483,12 @@ function handleConnection(socket) {
 		if (block.e.length > 512) return; // sanity cap
 		// Round 24: f:1 marks a force-FULL block (the ~1s heartbeat). Whitelisted so it
 		// survives relay — members count full-flagged blocks to learn the host's roster.
+		// ROUND 81: st tags which host stream the block belongs to ('B' = fixed base /
+		// idle enemies, 'H' = option-driven hostile / engaged enemies) so members can
+		// measure the REAL per-stream tick for the network debug HUD.
 		const f = block.f === 1 ? 1 : undefined;
-		world.broadcastHostState(ctx, username, 'entityState', { map: block.map, e: block.e, cb: !!block.cb, f });
+		const st = block.st === 'B' ? 'B' : (block.st === 'H' ? 'H' : undefined);
+		world.broadcastHostState(ctx, username, 'entityState', { map: block.map, e: block.e, cb: !!block.cb, f, st });
 	});
 
 	// ---- round 62: host streams enemy PROJECTILES so members see ranged attacks ----
