@@ -6,10 +6,11 @@ const path = require('path');
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const SAVES_DIR = path.join(DATA_DIR, 'saves');
-// A pre-rolled "new game" save that every brand-new account starts from
-// (罗姆布斯广场-迎新桥, story done, playtime zeroed). Optional: if absent, new
-// players simply start fresh.
-const DEFAULT_SAVE_FILE = path.join(DATA_DIR, 'default-save.json');
+// A pre-rolled "new game" save template that brand-new accounts receive when the
+// player picks the bridge start (新手港新手桥, ROUND 103). The client decrypts,
+// zeroes playtime and restores this blob; it is never persisted server-side until
+// the first normal save upload.
+const DEFAULT_SAVE_FILE = path.join(SAVES_DIR, '新手港新手桥.json');
 
 const FLUSH_INTERVAL_MS = 2000;
 
@@ -140,8 +141,8 @@ Persistence.prototype.loadGame = function (username) {
 	return null;
 };
 
-// The template new players start from (罗姆布斯广场-迎新桥). Returns the parsed
-// default-save.json, or null when no template has been installed.
+// The template new players start from (新手港新手桥 — Rookie Harbor bridge).
+// Returns the parsed save file, or null when no template has been installed.
 Persistence.prototype.loadDefaultSave = function () {
 	try {
 		if (fs.existsSync(DEFAULT_SAVE_FILE)) {

@@ -291,17 +291,21 @@ function handleConnection(socket) {
 
 		// Stage 1+: everyone is host of their own solo experience until they join
 		// a shared instance (world.changeMap decides the real host per-instance).
-		// New accounts start from the shared default save (罗姆布斯广场-迎新桥);
-		// returning accounts resume from their own uploaded save.
+		// NEW accounts are streamed the shared template save and the client lets the
+		// player choose between that bridge start and a completely fresh story save
+		// (handshakeResponse.isNew drives the prompt). Returning accounts resume
+		// from their own uploaded save.
 		let save = persistence.loadGame(name);
 		if (!save && isNew) {
 			save = persistence.loadDefaultSave();
-			if (save) console.log('[protocol] ' + name + ' starts from the default save (罗姆布斯广场-迎新桥)');
+			if (save) console.log('[protocol] ' + name + ' is a new account; template save ready');
 		}
 		socket.emit('handshakeResponse', {
 			success: true,
 			username: name,
 			host: true,
+			// ROUND 103: first-ever login — client shows the fresh/bridge choice popup.
+			isNew: !!isNew,
 			// Round 16: per-extra-party-member enemy HP multiplier the client applies
 			// using its own party roster size (config.json: monsterHpPerPlayer).
 			hpScale: config.monsterHpPerPlayer,
