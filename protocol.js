@@ -473,6 +473,9 @@ function handleConnection(socket) {
 			// owner is in a cutscene, instead of showing it mid-anim outside the
 			// cutscene's own actor set.
 			cs: s.cs ? 1 : 0,
+			// ROUND 104: fall/water flag — observers grant aggro grace while the
+			// owner quick-falls/respawns.
+			fl: s.fl ? 1 : 0,
 			// Round 11/22 (opt 3): element mode + class drive the mirror's melee
 			// sweep FX. They change rarely, so the client omits them when unchanged;
 			// when present they're whitelisted (number 0-4 / bounded string). The
