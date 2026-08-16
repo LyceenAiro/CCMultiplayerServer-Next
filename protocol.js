@@ -58,7 +58,13 @@ function handleConnection(socket) {
 		// socket with an old version) must be dropped silently and closed. This is
 		// the "old client keeps streaming playerState after a server update" fix.
 		if (socket._mpVersionBlocked || (typeof socket._mpVersion === 'string' && socket._mpVersion !== config.version)) {
-			try { socket.disconnect(true); } catch (_) { /* ignore */ }
+			// ROUND 114: use disconnect(false) — a DISCONNECT packet — NOT
+			// disconnect(true). disconnect(true) closes only the TRANSPORT, which
+			// socket.io-client treats as a "transport close" and AUTO-RECONNECTS
+			// forever; a DISCONNECT packet is the client's "io server disconnect"
+			// path and makes its Manager set skipReconnect=true, which is the only
+			// server-side way to stop an OLD client from reconnection-looping.
+			try { socket.disconnect(false); } catch (_) { /* ignore */ }
 			return true;
 		}
 		if (!authed()) {
@@ -257,14 +263,16 @@ function handleConnection(socket) {
 				// show the styled update popup instead of reconnect-forever.
 				version: config.version,
 			});
-			// ROUND 108: an OLD client's reconnect path can leave the rejected
+			// ROUND 108 + 114: an OLD client's reconnect path can leave the rejected
 			// socket open and keep streaming playerState from `username=null`, which
-			// spams dropIfNotAuthed every 5s forever. Mark it and force-close so the
-			// stream dies with the socket (the client-side reconnect gate then
-			// handles the update popup instead of an endless open stream).
+			// spams dropIfNotAuthed every 5s forever. Mark it and send a real
+			// DISCONNECT packet (NOT disconnect(true) — that only drops the transport
+			// and socket.io-client auto-reconnects forever, exactly the reported
+			// infinite-reconnect loop). The DISCONNECT packet makes the client's
+			// Manager skip reconnection entirely.
 			socket._mpVersion = clientVersion || '?';
 			socket._mpVersionBlocked = true;
-			setTimeout(function () { try { socket.disconnect(true); } catch (e) { /* ignore */ } }, 50);
+			setTimeout(function () { try { socket.disconnect(false); } catch (e) { /* ignore */ } }, 50);
 			return;
 		}
 		socket._mpVersion = clientVersion;
