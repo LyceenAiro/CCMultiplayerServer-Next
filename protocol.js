@@ -54,6 +54,13 @@ function handleConnection(socket) {
 		return username !== null;
 	}
 	function dropIfNotAuthed(evt) {
+		// ROUND 108: a socket whose handshake was version-rejected (or a pre-update
+		// socket with an old version) must be dropped silently and closed. This is
+		// the "old client keeps streaming playerState after a server update" fix.
+		if (socket._mpVersionBlocked || (typeof socket._mpVersion === 'string' && socket._mpVersion !== config.version)) {
+			try { socket.disconnect(true); } catch (_) { /* ignore */ }
+			return true;
+		}
 		if (!authed()) {
 			// A client that returned to the title screen may keep streaming playerState
 			// for a while on a logged-out socket; logging every packet floods the server
@@ -250,8 +257,17 @@ function handleConnection(socket) {
 				// show the styled update popup instead of reconnect-forever.
 				version: config.version,
 			});
+			// ROUND 108: an OLD client's reconnect path can leave the rejected
+			// socket open and keep streaming playerState from `username=null`, which
+			// spams dropIfNotAuthed every 5s forever. Mark it and force-close so the
+			// stream dies with the socket (the client-side reconnect gate then
+			// handles the update popup instead of an endless open stream).
+			socket._mpVersion = clientVersion || '?';
+			socket._mpVersionBlocked = true;
+			setTimeout(function () { try { socket.disconnect(true); } catch (e) { /* ignore */ } }, 50);
 			return;
 		}
+		socket._mpVersion = clientVersion;
 		const name = data && data.username;
 		if (!name) {
 			socket.emit('handshakeResponse', { failed: 'No username given' });
