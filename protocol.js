@@ -46,9 +46,21 @@ function crossDespawnDifferentInstances(affected) {
 	}
 }
 
+// ---- 1.70.61 story-sync pending handshakes ----
+// storyStartRequests lives at MODULE scope: the leader creates the record in
+// HIS connection closure, but each member's eligibility reply is handled inside
+// the MEMBER's connection closure (a socket may only listen for its own events).
+// storyJoinChecks stays per-connection (the accept + reply share one socket).
+const storyStartRequests = Object.create(null);
+let storyReqSeq = 1;
+
 function handleConnection(socket) {
 	// username is set once the socket has logged in (handshake).
 	let username = null;
+
+	// storyJoinChecks: reqId -> {quest, partyId, username, timer}. Settled on
+	// answer/timeout so a hostile or stalled client can never pin an invite.
+	const storyJoinChecks = Object.create(null);
 
 	function authed() {
 		return username !== null;
@@ -211,6 +223,146 @@ function handleConnection(socket) {
 		if (!socket || typeof name !== 'string' || !name) return;
 		const r = reason === 'kicked' || reason === 'disconnected' ? reason : 'left';
 		socket.emit('partyMemberLeft', { name, reason: r });
+	}
+
+	// ---- 1.70.61 剧情同步模式 (story sync mode) ----
+	// Server-side state machine: leader selects an accepted quest, every online
+	// member confirms their local client can participate (quest active OR solved),
+	// and from then on the leader relays quest state / story-event starts / skip
+	// votes through the party. The server only stores the mode's envelope
+	// (quest + leader); each CLIENT keeps the authoritative quest snapshot and
+	// applies/restores it locally.
+	const STORY_SYNC = {
+		CHECK_TIMEOUT_MS: 15000,  // eligibility handshake timeout (start + join)
+		STATE_MAX_TASKS: 128,     // sanity caps for sanitizeStoryQuestState
+		STATE_MAX_ARRAY: 200,
+		STATE_MAX_DEPTH: 8,
+		STATE_MAX_KEYS: 64,
+		STATE_MAX_NODES: 4096,
+	};
+
+	function isValidQuestId(quest) {
+		return typeof quest === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(quest);
+	}
+
+	function storyValue(v, depth, budget) {
+		if (!budget || budget.count <= 0) return undefined;
+		budget.count--;
+		if (v === null || typeof v === 'boolean') return v;
+		if (typeof v === 'number') return (isFinite(v) && Math.abs(v) <= 1e9) ? v : 0;
+		if (typeof v === 'string') return v.slice(0, 64);
+		if (depth >= STORY_SYNC.STATE_MAX_DEPTH) return undefined;
+		if (Array.isArray(v)) {
+			const out = [];
+			const max = Math.min(v.length, STORY_SYNC.STATE_MAX_ARRAY);
+			for (let i = 0; i < max && budget.count > 0; i++) {
+				const c = storyValue(v[i], depth + 1, budget);
+				if (c !== undefined) out.push(c);
+			}
+			return out;
+		}
+		if (typeof v === 'object') {
+			const out = {};
+			let n = 0;
+			for (const k in v) {
+				if (n >= STORY_SYNC.STATE_MAX_KEYS) break;
+				if (!/^[A-Za-z0-9_.-]{1,64}$/.test(k)) continue;
+				const c = storyValue(v[k], depth + 1, budget);
+				if (c !== undefined) { out[k] = c; n++; }
+			}
+			return out;
+		}
+		return undefined;
+	}
+
+	// Rebuild quest progress field-by-field. The member client applies ONLY this
+	// whitelisted {id,task,highest,finished,completed,labels} shape.
+	function sanitizeStoryQuestState(raw) {
+		if (!raw || typeof raw !== 'object') return null;
+		if (!isValidQuestId(raw.id)) return null;
+		const clampInt = (v, min, max) => {
+			const n = Number(v);
+			return (isFinite(n)) ? Math.max(min, Math.min(max, Math.round(n))) : min;
+		};
+		const budget = { count: STORY_SYNC.STATE_MAX_NODES };
+		const completed = storyValue(raw.completed, 1, budget);
+		const labels = storyValue(raw.labels, 1, budget);
+		if (!Array.isArray(completed)) return null;
+		const out = {
+			id: raw.id,
+			task: clampInt(raw.task, 0, STORY_SYNC.STATE_MAX_TASKS),
+			highest: clampInt(raw.highest, 0, STORY_SYNC.STATE_MAX_TASKS),
+			finished: !!raw.finished,
+			completed: completed,
+			labels: (labels && typeof labels === 'object' && !Array.isArray(labels)) ? labels : {},
+		};
+		// labels must map label names to booleans (the game only stores booleans).
+		for (const k in out.labels) {
+			if (typeof out.labels[k] !== 'boolean') return null;
+		}
+		return out;
+	}
+
+	// Emit `event` to every ONLINE member of a party (story events must cross
+	// map/instance boundaries: an out-of-range member still needs nudge/vote state).
+	function emitToParty(partyId, event, payload, exceptName) {
+		const p = party.getParty(partyId);
+		if (!p) return;
+		for (const m of p.members) {
+			if (m === exceptName) continue;
+			const s = accounts.getSocket(m);
+			if (s) s.emit(event, payload);
+		}
+	}
+
+	// Abort any OPEN skip vote for a party sync and tell the remaining members the
+	// result (pass:false). Used on departure/leader-cancel/new-event so a vote can
+	// never strand the requester's modal. Never throws.
+	function abortStoryVote(partyId, sync) {
+		if (!sync || !sync.vote) return;
+		const seq = sync.vote.seq;
+		sync.vote = null;
+		emitToParty(partyId, 'storySyncSkipResult', { seq, pass: false, reason: 'interrupted' });
+	}
+
+	// Party-departure bookkeeping for an ACTIVE story sync. MUST run BEFORE
+	// party.removeMember (the party record — and its sync envelope — dies on a
+	// disband). Semantics:
+	//   leader leaves/logs out  -> the WHOLE team exits story sync (leaderLeft);
+	//   member leaves/kicked   -> that member exits alone (leave), others continue.
+	// A 2-person party collapse ends the mode for the survivor too (partyEnd).
+	// `reason` is 'left' | 'kicked' | 'disconnected' (only for logging/end marker).
+	function storySyncOnDeparture(partyId, name, reason) {
+		const p = party.getParty(partyId);
+		if (!p || !p.storySync) return;
+		const sync = p.storySync;
+		const quest = sync.quest;
+		const survivors = p.members.filter((m) => m !== name);
+		if (sync.leader === name) {
+			abortStoryVote(partyId, sync);
+			p.storySync = null;
+			for (const m of survivors) {
+				const s = accounts.getSocket(m);
+				if (s) s.emit('storySyncEnd', { quest, reason: 'leaderLeft', leader: name });
+			}
+			const selfSock = accounts.getSocket(name);
+			if (selfSock) selfSock.emit('storySyncEnd', { quest, reason: 'leaderLeft', leader: name });
+			return;
+		}
+		const sock = accounts.getSocket(name);
+		if (sock) sock.emit('storySyncEnd', { quest, reason: 'leave', by: name, manner: reason });
+		// Any departure during an open skip vote invalidates "everyone agreed at
+		// the same moment" — abort it for the remaining members.
+		if (sync.vote) abortStoryVote(partyId, sync);
+		// With only the leader left the party itself disbands below.
+		if (survivors.length <= 1) {
+			abortStoryVote(partyId, sync);
+			p.storySync = null;
+			for (const m of survivors) {
+				const s = accounts.getSocket(m);
+				if (s) s.emit('storySyncEnd', { quest, reason: 'partyEnd' });
+			}
+		}
 	}
 
 	// ---- round 23: paced save DOWNLOAD (handshakeResponse no longer carries save) ----
@@ -381,6 +533,9 @@ function handleConnection(socket) {
 		// Notify presence BEFORE leaving the party/instance, so the party-member
 		// branch of broadcastPresence still sees the roster (and friends too).
 		broadcastPresence(name, false);
+		// 1.70.61: story-sync departure semantics run before the party record is
+		// mutated (leader leaves -> whole team ends; member leaves -> only they do).
+		storySyncOnDeparture(partyId, name, 'disconnected');
 		// world.disconnect migrates the INSTANCE host if this player held it
 		// (setHost to the next member) — survivors stay where they stand.
 		world.disconnect(ctx, name);
@@ -1446,32 +1601,26 @@ function handleConnection(socket) {
 		target.emit('partyInvite', { from: username, partyId });
 		socket.emit('partyActionResult', { action: 'invite', ok: true, to });
 	});
-	socket.on('partyAccept', function (data) {
-		if (dropIfNotAuthed('partyAccept')) return;
-		const partyId = data && data.partyId;
-		const targetParty = party.getParty(partyId);
-		if (!targetParty) {
-			socket.emit('partyActionResult', { action: 'accept', ok: false, error: 'Party no longer exists' });
-			return;
-		}
-		// ROUND 12 + round 23 review: refuse to exceed the 8-member cap BEFORE
-		// consuming the invite, so a full party doesn't burn it (the invite stays
-		// valid for a later retry once someone leaves).
-		if (targetParty.members.length >= 8) {
-			socket.emit('partyActionResult', { action: 'accept', ok: false, error: '队伍已满（最多 8 人）' });
-			return;
-		}
-		// Only someone actually invited may join (partyId is guessable: p1, p2, ...).
-		if (!party.consumeInvite(partyId, username)) {
-			socket.emit('partyActionResult', { action: 'accept', ok: false, error: 'No invite to this party' });
-			return;
-		}
+	function markStoryCheckSocket(reqId, quest) {
+		socket._mpStoryChecks = socket._mpStoryChecks || Object.create(null);
+		socket._mpStoryChecks[reqId] = quest;
+	}
+	function clearStoryCheckSocket(reqId) {
+		if (socket._mpStoryChecks && socket._mpStoryChecks[reqId]) delete socket._mpStoryChecks[reqId];
+	}
+
+	// The actual join body (invite must already be consumed). Extracted so the
+	// story-sync gate can run it from the async eligibility reply.
+	function completePartyAccept(partyId) {
 		// Leave any current party first (forced disband of the acceptor's old party).
 		// Capture the survivors BEFORE removing so a 2-person disband still notifies
 		// the old teammate (removeMember returns null on disband).
 		const prevPartyId = party.partyOf(username);
 		const prevSurvivors = prevPartyId && party.getParty(prevPartyId)
 			? party.getParty(prevPartyId).members.filter((m) => m !== username) : [];
+		// 1.70.61: leaving our old party must also exit its story sync (member
+		// leaves alone; a 2-person collapse ends it for the survivor).
+		if (prevPartyId && prevPartyId !== partyId) storySyncOnDeparture(prevPartyId, username, 'left');
 		const prev = party.removeMember(username);
 		if (prev) {
 			// Round 23 wave 3: the acceptor left their OLD party — its survivors get
@@ -1503,6 +1652,7 @@ function handleConnection(socket) {
 			socket.emit('partyActionResult', { action: 'accept', ok: false, error: 'Party no longer exists' });
 			return;
 		}
+		const joinedSync = p.storySync || null;
 		// ROUND 10: actively migrate every online member already on a map into the
 		// new party instance (solo:<u>:<map> -> party:<id>:<map>). The join path of
 		// world.changeMap emits the mutual onPlayerChangeMap enter events, so BOTH
@@ -1537,12 +1687,377 @@ function handleConnection(socket) {
 			const s = accounts.getSocket(m);
 			if (s) s.emit('partyReSync');
 		}
+		// 1.70.61: joining a party that is mid-way through a story sync carries the
+		// new member into the SAME sync (their coin was verified before accepting):
+		// push the mode envelope to them and ask the leader to resend the current
+		// quest state so the newcomer locks onto it immediately. A newcomer also
+		// invalidates any OPEN skip vote (they were never in the original vote).
+		if (joinedSync) {
+			if (joinedSync.vote) abortStoryVote(partyId, joinedSync);
+			socket.emit('storySyncStart', {
+				quest: joinedSync.quest,
+				leader: joinedSync.leader,
+				members: p.members.slice(),
+			});
+			const ls = accounts.getSocket(joinedSync.leader);
+			if (ls) ls.emit('storySyncResend', { quest: joinedSync.quest });
+		}
 		// NOTE: joining a party NO LONGER auto-teleports the acceptor to the leader.
 		// Regrouping is a separate, manual action: the client shows a
 		// "传送到队友身边" button (enabled only while in a party) which emits
 		// `partyRegroup`; only then do we answer with the leader's location so the
 		// requester can teleport. This keeps party-up and travelling decoupled.
+	}
+
+	function failStoryJoin(req, reason) {
+		if (!req || req.settled) { clearStoryCheckSocket(req.reqId); return; }
+		req.settled = true;
+		if (req.timer) { clearTimeout(req.timer); req.timer = null; }
+		delete storyJoinChecks[req.reqId];
+		// Settle the invite one way or the other — a denied/answered acceptance
+		// must not leave a pending invite pinned on the invitee forever.
+		party.consumeInvite(req.partyId, req.username);
+		req.socketResult.emit('partyActionResult', {
+			action: 'accept', ok: false,
+			error: '该队伍正在进行剧情同步，未承接或未完成当前同步任务的玩家无法加入',
+			storyQuest: req.quest, storyReason: reason,
+		});
+	}
+
+	socket.on('partyAccept', function (data) {
+		if (dropIfNotAuthed('partyAccept')) return;
+		const partyId = data && data.partyId;
+		const targetParty = party.getParty(partyId);
+		if (!targetParty) {
+			socket.emit('partyActionResult', { action: 'accept', ok: false, error: 'Party no longer exists' });
+			return;
+		}
+		// ROUND 12 + round 23 review: refuse to exceed the 8-member cap BEFORE
+		// consuming the invite, so a full party doesn't burn it (the invite stays
+		// valid for a later retry once someone leaves).
+		if (targetParty.members.length >= 8) {
+			socket.emit('partyActionResult', { action: 'accept', ok: false, error: '队伍已满（最多 8 人）' });
+			return;
+		}
+		// Only someone actually invited may join (partyId is guessable: p1, p2, ...).
+		// For a story-syncing party this check runs BEFORE the async eligibility
+		// handshake so an uninvited guesser can't hold a check slot open.
+		if (!party.hasInviteTo(partyId, username)) {
+			socket.emit('partyActionResult', { action: 'accept', ok: false, error: 'No invite to this party' });
+			return;
+		}
+		if (targetParty.storySync) {
+			// 1.70.61: story sync active -> the acceptor's client must prove this
+			// quest is accepted OR solved before the invite is consumed.
+			const reqId = 'sj' + (storyReqSeq++);
+			const rec = {
+				reqId, quest: targetParty.storySync.quest, partyId, username,
+				socketResult: socket, settled: false, timer: null,
+			};
+			rec.timer = setTimeout(function () { failStoryJoin(rec, 'timeout'); }, STORY_SYNC.CHECK_TIMEOUT_MS);
+			storyJoinChecks[reqId] = rec;
+			markStoryCheckSocket(reqId, rec.quest);
+			socket.emit('storySyncJoinCheck', { reqId, quest: rec.quest });
+			return;
+		}
+		if (!party.consumeInvite(partyId, username)) {
+			socket.emit('partyActionResult', { action: 'accept', ok: false, error: 'No invite to this party' });
+			return;
+		}
+		completePartyAccept(partyId);
 	});
+
+	// 1.70.61: partyAccept second phase — the acceptor's client just read its
+	// local quest state and reports active/solved availability.
+	socket.on('storySyncJoinCheckResult', function (data) {
+		if (dropIfNotAuthed('storySyncJoinCheckResult')) return;
+		if (rateLimited('storySyncJoinCheckResult', 10)) return;
+		const reqId = data && data.reqId;
+		const rec = reqId && storyJoinChecks[reqId];
+		if (!rec || rec.username !== username) return;
+		if (!socket._mpStoryChecks || socket._mpStoryChecks[reqId] !== rec.quest) return;
+		clearStoryCheckSocket(reqId);
+		if (rec.settled) return;
+		if (!isValidQuestId(data.quest) || data.quest !== rec.quest) { failStoryJoin(rec, 'mismatch'); return; }
+		const active = !!data.active;
+		const solved = !!data.solved;
+		const available = data.available !== false;
+		if (!available || (!active && !solved)) { failStoryJoin(rec, available ? 'questNotReady' : 'unavailable'); return; }
+		// Eligible: settle the pending record FIRST, then consume the invite and
+		// run the normal join path (completePartyAccept re-validates the party).
+		rec.settled = true;
+		if (rec.timer) { clearTimeout(rec.timer); rec.timer = null; }
+		delete storyJoinChecks[reqId];
+		if (!party.consumeInvite(rec.partyId, username)) {
+			socket.emit('partyActionResult', { action: 'accept', ok: false, error: 'No invite to this party' });
+			return;
+		}
+		completePartyAccept(rec.partyId);
+	});
+	// ---- 1.70.61 剧情同步模式: core message handlers ----
+	// Leader requests the mode; the server asks EVERY member's client (leader
+	// included) whether the quest is active/solved. As soon as every answer is in
+	// the server either raises the mode or pushes a failure to the whole party.
+
+	function settleStoryStart(rec, ok, reason, names) {
+		if (rec.settled) return;
+		rec.settled = true;
+		if (rec.timer) { clearTimeout(rec.timer); rec.timer = null; }
+		delete storyStartRequests[rec.reqId];
+		for (const m of rec.members) {
+			const s = accounts.getSocket(m);
+			if (s && s._mpStoryChecks && s._mpStoryChecks[rec.reqId]) delete s._mpStoryChecks[rec.reqId];
+		}
+		const p = party.getParty(rec.partyId);
+		if (ok) {
+			if (!p || p.storySync) {
+				emitToParty(rec.partyId, 'storySyncStartFailed', {
+					reqId: rec.reqId, quest: rec.quest,
+					reason: !p ? 'partyGone' : 'busy', names: [],
+				});
+				return;
+			}
+			p.storySync = { quest: rec.quest, leader: rec.leader, startedAt: Date.now(), eventSeq: 0, vote: null };
+			console.log('[story-sync] started in ' + rec.partyId + ': quest=' + rec.quest + ' leader=' + rec.leader + ' members=' + p.members.join(','));
+			emitToParty(rec.partyId, 'storySyncStart', {
+				quest: rec.quest, leader: rec.leader, members: p.members.slice(),
+			});
+		} else {
+			emitToParty(rec.partyId, 'storySyncStartFailed', {
+				reqId: rec.reqId, quest: rec.quest, reason: reason, names: names || [],
+			});
+		}
+	}
+
+	socket.on('storySyncRequest', function (data) {
+		if (dropIfNotAuthed('storySyncRequest')) return;
+		if (rateLimited('storySyncRequest', 2)) return;
+		const quest = data && data.quest;
+		if (!isValidQuestId(quest)) return;
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		if (!p || p.leader !== username || p.members.length < 2) {
+			socket.emit('storySyncStartFailed', { reqId: '', quest: quest, reason: 'notLeader', names: [] });
+			return;
+		}
+		if (p.storySync) {
+			socket.emit('storySyncStartFailed', { reqId: '', quest: quest, reason: 'busy', names: [] });
+			return;
+		}
+		// Every member must be ONLINE right now (an offline teammate can't confirm
+		// eligibility and could never receive the start envelope).
+		const offline = p.members.filter((m) => !accounts.isOnline(m));
+		if (offline.length) {
+			socket.emit('storySyncStartFailed', { reqId: '', quest: quest, reason: 'offline', names: offline });
+			return;
+		}
+		const reqId = 'ss' + (storyReqSeq++);
+		const rec = {
+			reqId, quest, partyId, leader: username, members: p.members.slice(),
+			answers: Object.create(null), settled: false, timer: null,
+		};
+		rec.timer = setTimeout(function () {
+			const missing = rec.members.filter((m) => !rec.answers[m]);
+			settleStoryStart(rec, false, 'timeout', missing);
+		}, STORY_SYNC.CHECK_TIMEOUT_MS);
+		storyStartRequests[reqId] = rec;
+		for (const m of rec.members) {
+			const s = accounts.getSocket(m);
+			if (!s) continue;
+			s._mpStoryChecks = s._mpStoryChecks || Object.create(null);
+			s._mpStoryChecks[reqId] = quest;
+			s.emit('storySyncCheck', { reqId, quest });
+		}
+		console.log('[story-sync] eligibility check ' + reqId + ' quest=' + quest + ' members=' + rec.members.join(','));
+	});
+
+	socket.on('storySyncCheckResult', function (data) {
+		if (dropIfNotAuthed('storySyncCheckResult')) return;
+		if (rateLimited('storySyncCheckResult', 10)) return;
+		const reqId = data && data.reqId;
+		const rec = reqId && storyStartRequests[reqId];
+		if (!rec || rec.members.indexOf(username) === -1) return;
+		if (!socket._mpStoryChecks || socket._mpStoryChecks[reqId] !== rec.quest) return;
+		if (rec.settled) return;
+		if (!isValidQuestId(data.quest) || data.quest !== rec.quest) return; // bad reply: still counts (timeout cleans up)
+		rec.answers[username] = {
+			available: data.available !== false,
+			active: !!data.active,
+			solved: !!data.solved,
+		};
+		delete socket._mpStoryChecks[reqId];
+		if (Object.keys(rec.answers).length < rec.members.length) return;
+		// All answered. Validate the CURRENT party shape: a departure mid-check
+		// means the request is stale regardless of the answers.
+		const p = party.getParty(rec.partyId);
+		if (!p || p.leader !== rec.leader
+			|| p.members.length !== rec.members.length
+			|| rec.members.some((m) => p.members.indexOf(m) === -1)) {
+			settleStoryStart(rec, false, 'partyChanged', []);
+			return;
+		}
+		const bad = [];
+		for (const m of rec.members) {
+			const a = rec.answers[m];
+			if (!a) { bad.push(m); continue; }
+			if (!a.available || (!a.active && !a.solved)) bad.push(m);
+		}
+		if (bad.length) { settleStoryStart(rec, false, 'membersNotReady', bad); return; }
+		const leaderAnswer = rec.answers[rec.leader];
+		if (!leaderAnswer || !leaderAnswer.active) { settleStoryStart(rec, false, 'leaderNotActive', []); return; }
+		settleStoryStart(rec, true, '', []);
+	});
+
+	socket.on('storySyncState', function (data) {
+		if (dropIfNotAuthed('storySyncState')) return;
+		if (rateLimited('storySyncState', 10)) return;
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		const sync = p && p.storySync;
+		if (!sync || sync.leader !== username) return;
+		const state = sanitizeStoryQuestState(data && data.state);
+		if (!state || state.id !== sync.quest) return;
+		emitToParty(partyId, 'storySyncState', {
+			from: username,
+			quest: sync.quest,
+			state,
+			map: (data && typeof data.map === 'string' && data.map.length <= 64) ? data.map : '',
+		}, username);
+	});
+
+	socket.on('storySyncEvent', function (data) {
+		if (dropIfNotAuthed('storySyncEvent')) return;
+		if (rateLimited('storySyncEvent', 5)) return;
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		const sync = p && p.storySync;
+		if (!sync || sync.leader !== username) return;
+		if (!data || data.quest !== sync.quest) return;
+		const map = (typeof data.map === 'string' && data.map.length <= 96) ? data.map : '';
+		const key = (typeof data.key === 'string' && /^[A-Za-z0-9_.-]{1,48}$/.test(data.key)) ? data.key : '';
+		const kind = data.kind === 'location' ? 'location' : 'trigger';
+		const type = Number(data.type);
+		if (!map || !key || !isFinite(type) || type < 1 || type > 5) return;
+		const seq = (sync.eventSeq || 0) + 1;
+		sync.eventSeq = seq;
+		sync.vote = null; // a fresh story event invalidates any open skip vote
+		emitToParty(partyId, 'storySyncEvent', {
+			from: username, quest: sync.quest, map, key, kind, type, seq,
+		});
+		console.log('[story-sync] event seq=' + seq + ' kind=' + kind + ' key=' + key + ' map=' + map + ' by=' + username);
+	});
+
+	// The leader's engine event finished: abort any OPEN skip vote so a
+	// no-timeout vote modal on an off-map/afk member can't linger after the
+	// animation it was voting about is already over.
+	socket.on('storySyncEventEnd', function (data) {
+		if (dropIfNotAuthed('storySyncEventEnd')) return;
+		if (rateLimited('storySyncEventEnd', 5)) return;
+		const seq = Number(data && data.seq);
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		const sync = p && p.storySync;
+		if (!sync || sync.leader !== username || !isFinite(seq) || seq !== (sync.eventSeq || 0)) return;
+		if (sync.vote && sync.vote.seq === seq) {
+			sync.vote = null;
+			emitToParty(partyId, 'storySyncSkipResult', { seq, pass: false, reason: 'eventEnded' });
+		}
+	});
+
+	socket.on('storySyncCancel', function (data) {
+		if (dropIfNotAuthed('storySyncCancel')) return;
+		if (rateLimited('storySyncCancel', 2)) return;
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		const sync = p && p.storySync;
+		if (!sync || sync.leader !== username) return;
+		if (data && data.quest && data.quest !== sync.quest) return;
+		abortStoryVote(partyId, sync);
+		p.storySync = null;
+		const quest = sync.quest;
+		emitToParty(partyId, 'storySyncEnd', { quest, reason: 'cancel', by: username });
+		console.log('[story-sync] cancelled in ' + partyId + ' quest=' + quest + ' by=' + username);
+	});
+
+	socket.on('storySyncComplete', function (data) {
+		if (dropIfNotAuthed('storySyncComplete')) return;
+		if (rateLimited('storySyncComplete', 5)) return;
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		const sync = p && p.storySync;
+		if (!sync || sync.leader !== username) return;
+		const state = sanitizeStoryQuestState(data && data.state);
+		if (!state || state.id !== sync.quest) return;
+		abortStoryVote(partyId, sync);
+		p.storySync = null;
+		const quest = sync.quest;
+		emitToParty(partyId, 'storySyncEnd', { quest, reason: 'complete', state, by: username });
+		console.log('[story-sync] complete in ' + partyId + ' quest=' + quest + ' by=' + username);
+	});
+
+	// Skip consensus: any member may request a skip for the current relayed event
+	// (seq). The server collects votes — no timeout by design (user decision); a
+	// departure/leave/new-event/cancel interrupts the vote as "no".
+	socket.on('storySyncSkipVote', function (data) {
+		if (dropIfNotAuthed('storySyncSkipVote')) return;
+		if (rateLimited('storySyncSkipVote', 4)) return;
+		const seq = Number(data && data.seq);
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		const sync = p && p.storySync;
+		if (!sync || !isFinite(seq) || seq !== (sync.eventSeq || 0)) return;
+		if (sync.vote && sync.vote.seq !== seq) abortStoryVote(partyId, sync);
+		if (sync.vote) return; // duplicate request while the vote is open -> ignore
+		sync.vote = { seq, from: username, answers: Object.create(null) };
+		sync.vote.answers[username] = true;
+		emitToParty(partyId, 'storySyncSkipVote', { seq, from: username }, username);
+		console.log('[story-sync] skip vote seq=' + seq + ' by=' + username);
+	});
+
+	socket.on('storySyncSkipAnswer', function (data) {
+		if (dropIfNotAuthed('storySyncSkipAnswer')) return;
+		if (rateLimited('storySyncSkipAnswer', 4)) return;
+		const seq = Number(data && data.seq);
+		const yes = !!data && data.yes === true;
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		const sync = p && p.storySync;
+		const vote = sync && sync.vote;
+		if (!vote || vote.seq !== seq || p.members.indexOf(username) === -1) return;
+		if (vote.answers[username] !== undefined && vote.answers[username] !== yes) {
+			// A changed mind is simply recorded; the first no still kills the vote.
+		}
+		if (!yes) {
+			sync.vote = null;
+			emitToParty(partyId, 'storySyncSkipResult', { seq, pass: false, from: username, reason: 'declined' });
+			console.log('[story-sync] skip vote seq=' + seq + ' declined by=' + username);
+			return;
+		}
+		vote.answers[username] = true;
+		for (const m of p.members) {
+			if (vote.answers[m] !== true) return; // still waiting
+		}
+		sync.vote = null;
+		emitToParty(partyId, 'storySyncSkipResult', { seq, pass: true, from: username });
+		console.log('[story-sync] skip vote seq=' + seq + ' passed unanimously');
+	});
+
+	socket.on('storySyncNudge', function (data) {
+		if (dropIfNotAuthed('storySyncNudge')) return;
+		if (rateLimited('storySyncNudge', 2)) return;
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		const sync = p && p.storySync;
+		if (!sync) return;
+		if (data && data.quest && data.quest !== sync.quest) return;
+		emitToParty(partyId, 'storySyncNudge', {
+			from: username,
+			quest: sync.quest,
+			to: Array.isArray(data && data.to) ? data.to.slice(0, 8)
+				.filter((x) => typeof x === 'string' && x.length <= 32) : [],
+		}, username);
+	});
+
 	socket.on('partyRegroup', function (data) {
 		if (dropIfNotAuthed('partyRegroup')) return;
 		const partyId = party.partyOf(username);
@@ -1580,6 +2095,8 @@ function handleConnection(socket) {
 		if (dropIfNotAuthed('partyLeave')) return;
 		const partyId = party.partyOf(username);
 		const others = partyId && party.getParty(partyId) ? party.getParty(partyId).members.filter((m) => m !== username) : [];
+		// 1.70.61: exit story sync BEFORE removing ourselves from the party.
+		storySyncOnDeparture(partyId, username, 'left');
 		const updated = party.removeMember(username);
 		socket.emit('partySelfEvent', { event: 'leave' });
 		socket.emit('partyUpdate', null);
@@ -1715,6 +2232,8 @@ function handleConnection(socket) {
 		const p = partyId && party.getParty(partyId);
 		if (!p || p.leader !== username) return;          // leader-only
 		if (p.members.indexOf(target) === -1) return;     // must actually be a member
+		// 1.70.61: the kicked member leaves the sync alone; the rest continue.
+		storySyncOnDeparture(partyId, target, 'kicked');
 		const others = p.members.filter((m) => m !== username && m !== target);
 		const updated = party.removeMember(target);
 		// The kicked player loses their party exactly like a leave.

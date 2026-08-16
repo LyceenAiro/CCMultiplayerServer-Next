@@ -48,6 +48,22 @@ Party.prototype.consumeInvite = function (partyId, username) {
 	return false;
 };
 
+// True when `username` has a pending invite to this EXACT party (non-consuming —
+// used by the story-sync join gate, which must check the invite before the
+// async quest-eligibility handshake).
+Party.prototype.hasInviteTo = function (partyId, username) {
+	const set = this.pendingInvites[username];
+	if (!set) return false;
+	const entry = set[partyId];
+	if (!entry) return false;
+	// Prune a stale invite lazily (same TTL as hasPendingInvite).
+	if (Date.now() - (entry.t || 0) > INVITE_TTL_MS) {
+		delete set[partyId];
+		return false;
+	}
+	return true;
+};
+
 // Drop all pending invites for a user (on logout).
 Party.prototype.clearInvites = function (username) {
 	delete this.pendingInvites[username];
@@ -96,9 +112,26 @@ Party.prototype.createParty = function (leader) {
 	// of party members who have opened that chest. Per-PARTY storage (survives
 	// reconnects; strangers in shared towns can never pollute it). Deleted with
 	// the record when the party disbands (removeMember single-member collapse).
-	this.parties[id] = { id, leader, members: [leader], openedChests: Object.create(null) };
+	this.parties[id] = { id, leader, members: [leader], openedChests: Object.create(null), storySync: null };
 	this.userParty[leader] = id;
 	return id;
+};
+
+// Story-sync mode state (剧情同步模式). Per party:
+//   { quest, leader, startedAt, eventSeq, vote } — membership always mirrors
+//   p.members (join during sync is server-gated). `eventSeq` increments for each
+//   leader-relayed story event so skip votes can be scoped to one animation.
+//   `vote` is the one open skip vote: { seq, from, answers } or null.
+Party.prototype.getStorySync = function (partyId) {
+	const p = this.parties[partyId];
+	return p ? p.storySync : null;
+};
+
+Party.prototype.setStorySync = function (partyId, storySync) {
+	const p = this.parties[partyId];
+	if (!p) return false;
+	p.storySync = storySync;
+	return true;
 };
 
 // Round 20: record that `username` opened `chestKey` in the given party. Returns
