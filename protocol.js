@@ -234,7 +234,10 @@ function handleConnection(socket) {
 	// applies/restores it locally.
 	const STORY_SYNC = {
 		CHECK_TIMEOUT_MS: 15000,  // eligibility handshake timeout (start + join)
-		STATE_MAX_TASKS: 128,     // sanity caps for sanitizeStoryQuestState
+		STATE_MAX_TASKS: 1000000, // side-quest task counts are tiny; the synthetic
+		// 1.70.64 MAIN-STORY target stores plot.line here, which legitimately
+		// reaches the final chapter threshold (46000+) — the old cap (128)
+		// clipped it and would have corrupted every main-story sync packet.
 		STATE_MAX_ARRAY: 200,
 		STATE_MAX_DEPTH: 8,
 		STATE_MAX_KEYS: 64,
