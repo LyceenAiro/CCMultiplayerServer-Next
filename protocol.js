@@ -320,12 +320,38 @@ function handleConnection(socket) {
 
 	// Abort any OPEN skip vote for a party sync and tell the remaining members the
 	// result (pass:false). Used on departure/leader-cancel/new-event so a vote can
-	// never strand the requester's modal. Never throws.
+	// never strand the requester's banner. Never throws.
 	function abortStoryVote(partyId, sync) {
 		if (!sync || !sync.vote) return;
 		const seq = sync.vote.seq;
 		sync.vote = null;
 		emitToParty(partyId, 'storySyncSkipResult', { seq, pass: false, reason: 'interrupted' });
+	}
+
+	// Plain-object snapshot of a skip vote's answers for the wire (the votes live
+	// in a normal object; this just guards against accidental mutation sharing).
+	function storySkipVoteAnswers(vote) {
+		const out = {};
+		if (vote && vote.answers) {
+			for (const k in vote.answers) {
+				if (vote.answers[k] === true) out[k] = true;
+			}
+		}
+		return out;
+	}
+
+	// True (and settles + broadcasts the pass) when every CURRENT party member has
+	// answered YES. A member who left mid-vote is no longer in p.members, but the
+	// departure path aborts the vote first, so this never passes on a stale roster.
+	function settleStorySkipVoteIfUnanimous(partyId, p, sync, seq, from) {
+		for (const m of p.members) {
+			if (sync.vote && sync.vote.answers[m] === true) continue;
+			return false;
+		}
+		sync.vote = null;
+		emitToParty(partyId, 'storySyncSkipResult', { seq, pass: true, from });
+		console.log('[story-sync] skip vote seq=' + seq + ' passed unanimously');
+		return true;
 	}
 
 	// Party-departure bookkeeping for an ACTIVE story sync. MUST run BEFORE
@@ -2025,7 +2051,9 @@ function handleConnection(socket) {
 
 	// Skip consensus: any member may request a skip for the current relayed event
 	// (seq). The server collects votes — no timeout by design (user decision); a
-	// departure/leave/new-event/cancel interrupts the vote as "no".
+	// departure/leave/new-event/cancel interrupts the vote as "no". Every answer
+	// (including the requester's initial YES) is broadcast as a full `answers`
+	// map, so every client can render the green/grey diamond banner live.
 	socket.on('storySyncSkipVote', function (data) {
 		if (dropIfNotAuthed('storySyncSkipVote')) return;
 		if (rateLimited('storySyncSkipVote', 4)) return;
@@ -2033,13 +2061,33 @@ function handleConnection(socket) {
 		const partyId = party.partyOf(username);
 		const p = partyId && party.getParty(partyId);
 		const sync = p && p.storySync;
-		if (!sync || !isFinite(seq) || seq !== (sync.eventSeq || 0)) return;
+		if (!sync || !p || !isFinite(seq) || seq !== (sync.eventSeq || 0)
+			|| p.members.indexOf(username) === -1) return;
 		if (sync.vote && sync.vote.seq !== seq) abortStoryVote(partyId, sync);
-		if (sync.vote) return; // duplicate request while the vote is open -> ignore
-		sync.vote = { seq, from: username, answers: Object.create(null) };
+		if (sync.vote) {
+			// A second player pressing skip while the vote is open is simply their
+			// YES — no duplicate ballot. Already-answered presses are ignored.
+			if (sync.vote.answers[username] !== true) {
+				sync.vote.answers[username] = true;
+				emitToParty(partyId, 'storySyncSkipVoteUpdate', {
+					seq,
+					answers: storySkipVoteAnswers(sync.vote),
+				});
+			}
+			settleStorySkipVoteIfUnanimous(partyId, p, sync, seq, username);
+			return;
+		}
+		sync.vote = { seq, from: username, answers: {} };
 		sync.vote.answers[username] = true;
-		emitToParty(partyId, 'storySyncSkipVote', { seq, from: username }, username);
+		// Send the ballot to EVERYONE (requester included) so all clients render
+		// the same banner state from the same authoritative packet.
+		emitToParty(partyId, 'storySyncSkipVote', {
+			seq,
+			from: username,
+			answers: storySkipVoteAnswers(sync.vote),
+		});
 		console.log('[story-sync] skip vote seq=' + seq + ' by=' + username);
+		settleStorySkipVoteIfUnanimous(partyId, p, sync, seq, username);
 	});
 
 	socket.on('storySyncSkipAnswer', function (data) {
@@ -2052,22 +2100,21 @@ function handleConnection(socket) {
 		const sync = p && p.storySync;
 		const vote = sync && sync.vote;
 		if (!vote || vote.seq !== seq || p.members.indexOf(username) === -1) return;
-		if (vote.answers[username] !== undefined && vote.answers[username] !== yes) {
-			// A changed mind is simply recorded; the first no still kills the vote.
-		}
 		if (!yes) {
+			// A single NO cancels the whole vote immediately.
 			sync.vote = null;
 			emitToParty(partyId, 'storySyncSkipResult', { seq, pass: false, from: username, reason: 'declined' });
 			console.log('[story-sync] skip vote seq=' + seq + ' declined by=' + username);
 			return;
 		}
-		vote.answers[username] = true;
-		for (const m of p.members) {
-			if (vote.answers[m] !== true) return; // still waiting
+		if (vote.answers[username] !== true) {
+			vote.answers[username] = true;
+			emitToParty(partyId, 'storySyncSkipVoteUpdate', {
+				seq,
+				answers: storySkipVoteAnswers(vote),
+			});
 		}
-		sync.vote = null;
-		emitToParty(partyId, 'storySyncSkipResult', { seq, pass: true, from: username });
-		console.log('[story-sync] skip vote seq=' + seq + ' passed unanimously');
+		settleStorySkipVoteIfUnanimous(partyId, p, sync, seq, username);
 	});
 
 	socket.on('storySyncNudge', function (data) {
