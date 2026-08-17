@@ -1944,7 +1944,7 @@ function handleConnection(socket) {
 		if (!data || data.quest !== sync.quest) return;
 		const map = (typeof data.map === 'string' && data.map.length <= 96) ? data.map : '';
 		const key = (typeof data.key === 'string' && /^[A-Za-z0-9_.-]{1,48}$/.test(data.key)) ? data.key : '';
-		const kind = data.kind === 'location' ? 'location' : 'trigger';
+		const kind = data.kind === 'location' ? 'location' : data.kind === 'npc' ? 'npc' : 'trigger';
 		const type = Number(data.type);
 		if (!map || !key || !isFinite(type) || type < 1 || type > 5) return;
 		const seq = (sync.eventSeq || 0) + 1;
@@ -1959,6 +1959,25 @@ function handleConnection(socket) {
 	// The leader's engine event finished: abort any OPEN skip vote so a
 	// no-timeout vote modal on an off-map/afk member can't linger after the
 	// animation it was voting about is already over.
+	// 1.70.71: any member clicked a story NPC — raise the gather banner on the
+	// WHOLE party (each client finds its local copy of the NPC by mapId/name).
+	// The actual story event still starts later, leader-authoritatively, via the
+	// normal storySyncEvent relay with kind='npc'.
+	socket.on('storySyncNpcRequest', function (data) {
+		if (dropIfNotAuthed('storySyncNpcRequest')) return;
+		if (rateLimited('storySyncNpcRequest', 5)) return;
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		const sync = p && p.storySync;
+		if (!sync) return;
+		if (!data || data.quest !== sync.quest) return;
+		const map = (typeof data.map === 'string' && data.map.length <= 96) ? data.map : '';
+		const key = (typeof data.key === 'string' && /^[A-Za-z0-9_.-]{1,48}$/.test(data.key)) ? data.key : '';
+		if (!map || !key) return;
+		emitToParty(partyId, 'storySyncNpcRequest', { from: username, quest: sync.quest, map, key }, username);
+		console.log('[story-sync] npc gather request key=' + key + ' map=' + map + ' by=' + username);
+	});
+
 	socket.on('storySyncEventEnd', function (data) {
 		if (dropIfNotAuthed('storySyncEventEnd')) return;
 		if (rateLimited('storySyncEventEnd', 5)) return;
