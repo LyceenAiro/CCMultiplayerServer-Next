@@ -1890,6 +1890,12 @@ function handleConnection(socket) {
 		// All answered. Validate the CURRENT party shape: a departure mid-check
 		// means the request is stale regardless of the answers.
 		const p = party.getParty(rec.partyId);
+		// 1.70.63 diagnostics: log every member's answer so a failed start can be
+		// explained from the server log without re-running the handshake.
+		console.log('[story-sync] check ' + rec.reqId + ' answers: ' + rec.members.map((m) => {
+			const a = rec.answers[m];
+			return m + '=' + (a ? (a.available ? (a.active ? 'active' : 'solved') : 'unavailable') : 'no-answer');
+		}).join(', '));
 		if (!p || p.leader !== rec.leader
 			|| p.members.length !== rec.members.length
 			|| rec.members.some((m) => p.members.indexOf(m) === -1)) {
