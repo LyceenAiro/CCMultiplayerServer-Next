@@ -58,6 +58,10 @@ Then point the client's `config/config.json` at it, e.g.:
   `killEntity`, …) to the other users on the same map.
 - `userUtilities.js` / `cmd.js` provide helpers and an optional interactive
   console.
+- `persistence.js` stores accounts, friendships and per-user cloud saves in
+  `data/`. Since **1.71.0** it also keeps the **last five distinct save
+  mirrors** per player; the client's 镜像回溯 (rollback) login flow can stream
+  any one of them back via `saveMirrorRestore`.
 - The server also serves static game files from a local `./game` folder under
   `/data/*` and `/media/*` (used for development; not required for a normal
   relay).

@@ -92,6 +92,11 @@ Persistence.prototype.flush = function () {
 // Windows (NTFS) is case-insensitive, so "Alice.json" and "alice.json" are the
 // same file even though they're distinct accounts. Add a case-sensitive hash of
 // the exact username to the filename so differently-cased accounts never collide.
+// 1.71.0: how many save mirrors are retained per player (the client's 镜像回溯
+// picker shows these newest-first). Mirror data lives inside the same per-user
+// save file so it follows the existing atomic-write/backup story.
+const SAVE_MIRROR_MAX = 5;
+
 function saveFileFor(username) {
 	let h = 0;
 	for (let i = 0; i < username.length; i++) h = ((h * 31 + username.charCodeAt(i)) >>> 0);
@@ -106,6 +111,22 @@ Persistence.prototype.saveGame = function (username, slot, data) {
 	} catch (e) { /* overwrite */ }
 	existing[slot] = data;
 	existing.updatedAt = new Date().toISOString();
+	// 1.71.0: keep the last N distinct save images for rollback. Consecutive
+	// identical uploads (e.g. save spamming while idle) collapse into one mirror.
+	try {
+		const mirrors = Array.isArray(existing.mirrors) ? existing.mirrors : [];
+		const latest = mirrors[0];
+		if (!latest || latest.data !== data) {
+			mirrors.unshift({
+				at: existing.updatedAt,
+				slot,
+				bytes: typeof data === 'string' ? data.length : 0,
+				data,
+			});
+			while (mirrors.length > SAVE_MIRROR_MAX) mirrors.pop();
+			existing.mirrors = mirrors;
+		}
+	} catch (e) { /* mirrors are best-effort */ }
 	try {
 		// Atomic write (tmp + rename) so a crash mid-write can't truncate the save.
 		const tmp = file + '.tmp';
@@ -114,6 +135,30 @@ Persistence.prototype.saveGame = function (username, slot, data) {
 	} catch (e) {
 		console.error('[persistence] saveGame failed for ' + username + ':', e.message);
 	}
+};
+
+// 1.71.0: metadata only (newest first) for the client's rollback picker. The raw
+// mirror data stays on disk until loadSaveMirror asks for one entry.
+Persistence.prototype.listSaveMirrors = function (username) {
+	const game = this.loadGame(username);
+	if (!game || !Array.isArray(game.mirrors)) return [];
+	return game.mirrors.slice(0, SAVE_MIRROR_MAX).map((m, index) => ({
+		index,
+		at: typeof m.at === 'string' ? m.at : '',
+		slot: typeof m.slot === 'string' ? m.slot : 'autoSlot',
+		bytes: typeof m.bytes === 'number' ? m.bytes : 0,
+	}));
+};
+
+// 1.71.0: return ONE mirrored raw save string by index (newest first). Negative
+// index means "current latest save" (the picker's cancel/fallback path).
+Persistence.prototype.loadSaveMirror = function (username, index) {
+	const game = this.loadGame(username);
+	if (!game) return null;
+	if (!Number.isInteger(index) || index < 0) return (typeof game.autoSlot === 'string') ? game.autoSlot : null;
+	const mirrors = Array.isArray(game.mirrors) ? game.mirrors : [];
+	const m = mirrors[index];
+	return m && typeof m.data === 'string' ? m.data : null;
 };
 
 Persistence.prototype.loadGame = function (username) {

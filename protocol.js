@@ -505,6 +505,11 @@ function handleConnection(socket) {
 			save = persistence.loadDefaultSave();
 			if (save) console.log('[protocol] ' + name + ' is a new account; template save ready');
 		}
+		// 1.71.0: 镜像回溯 mode. Identify normally (so the connection is fully
+		// authenticated) but DO NOT stream the latest save yet — the client first
+		// shows the five-snapshot picker and then asks for one specific mirror via
+		// `saveMirrorRestore`. The picker can also fall back to the latest save.
+		const mirrorMode = !!(data && data.mirrorMode);
 		socket.emit('handshakeResponse', {
 			success: true,
 			username: name,
@@ -518,11 +523,18 @@ function handleConnection(socket) {
 			// client already sent its own version in the handshake payload).
 			version: config.version,
 			mapName: null, // no forced map; the client uses its own save / start map
+			// 1.71.0: save-mirror metadata (newest first). Always present in mirror
+			// mode; omitted otherwise to keep the normal handshake unchanged.
+			mirrors: mirrorMode ? persistence.listSaveMirrors(name) : undefined,
 		});
 		// Round 23: the save is NO LONGER embedded in the handshakeResponse (that
 		// sent a ~60KB string in one packet). It is streamed as paced saveDownload
 		// parts (config.saveDownloadKbS) right after — see streamSaveDownload above.
-		streamSaveDownload(save && save.autoSlot ? save.autoSlot : null);
+		if (!mirrorMode) {
+			streamSaveDownload(save && save.autoSlot ? save.autoSlot : null);
+		} else {
+			console.log('[protocol] ' + name + ' mirror rollback mode — waiting for saveMirrorRestore');
+		}
 
 		// Proactively push the friend's list right after login. Friends are persisted
 		// server-side, so a returning player already HAS friends — but their client
@@ -670,6 +682,9 @@ function handleConnection(socket) {
 		world.updateMemberPos(username, s.pos);
 		world.broadcastToInstance(ctx, username, 'playerState', {
 			player: username, pos: s.pos, face: s.face, anim: s.anim,
+			// 1.71.0: extern animations (sit/pose). Bounded strings, omitted below.
+			xa: (typeof s.xa === 'string' && s.xa.length <= 96) ? s.xa : '',
+			xf: (typeof s.xf === 'string' && s.xf.length <= 48) ? s.xf : '',
 			// Death flag: teammates despawn the mirror while its owner is dead
 			// (instead of showing a frozen corpse) and respawn it on recovery.
 			dead: s.dead ? 1 : 0,
@@ -1190,6 +1205,32 @@ function handleConnection(socket) {
 		if (!data || typeof data.mapId !== 'number' || !Number.isInteger(data.mapId) || data.mapId <= 0) return;
 		if (typeof data.map !== 'string' || data.map.length === 0 || data.map.length > 128) return;
 		world.broadcastToInstance(ctx, username, 'plantBreak', { map: data.map, mapId: data.mapId });
+	});
+
+	// 1.71.0: dungeon puzzle-state relay. Any client sends a compact list of
+	// changed puzzle entities; the server whitelists the fields and broadcasts to
+	// the rest of the instance (sender excluded). `gone` lets peers kill a local
+	// copy that was destroyed on the sender (e.g. an ice pillar).
+	socket.on('puzzleState', function (data) {
+		if (dropIfNotAuthed('puzzleState')) return;
+		if (rateLimited('puzzleState', 20)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96 || !Array.isArray(data.entries)) return;
+		const out = [];
+		for (const e of data.entries) {
+			if (!e || typeof e.mi !== 'number' || !Number.isInteger(e.mi) || e.mi <= 0) continue;
+			if (out.length >= 160) break;
+			const clean = { mi: e.mi };
+			if (e.gone === 1) clean.gone = 1;
+			if (Array.isArray(e.p) && e.p.length === 3
+				&& e.p.every((v) => typeof v === 'number' && isFinite(v) && Math.abs(v) <= 1e6)) clean.p = e.p.map(Math.round);
+			for (const k of ['on', 'hits', 'st', 'ph', 'act', 'mv', 'hd']) {
+				if (typeof e[k] === 'number' && isFinite(e[k])) clean[k] = Math.round(e[k]);
+			}
+			if (typeof e.anim === 'string' && e.anim.length <= 48) clean.anim = e.anim;
+			out.push(clean);
+		}
+		if (!out.length) return;
+		world.broadcastToInstance(ctx, username, 'puzzleState', { map: data.map, entries: out });
 	});
 
 	// ---- round 45 (Gap A, host origin): the HOST applied a member's forwarded hit to a
@@ -2429,6 +2470,27 @@ function handleConnection(socket) {
 			return;
 		}
 		targetSocket.emit('chat', { from: username, text, channel: 'private' });
+	});
+
+	// 1.71.0: 镜像回溯 — the client picked one of the five save mirrors (or -1
+	// for "just use the latest"). Stream that exact raw save through the normal
+	// saveDownload channel; the client restores it exactly like a login download.
+	socket.on('saveMirrorRestore', function (data) {
+		if (dropIfNotAuthed('saveMirrorRestore')) return;
+		if (rateLimited('saveMirrorRestore', 2)) return;
+		const index = Number(data && data.index);
+		if (!isFinite(index) || index < -1 || index > 20) {
+			socket.emit('saveMirrorRestoreResult', { ok: false, reason: 'invalid' });
+			return;
+		}
+		const raw = persistence.loadSaveMirror(username, index);
+		if (raw === null) {
+			socket.emit('saveMirrorRestoreResult', { ok: false, reason: index < 0 ? 'noSave' : 'notFound' });
+			return;
+		}
+		socket.emit('saveMirrorRestoreResult', { ok: true, index });
+		streamSaveDownload(raw);
+		console.log('[protocol] ' + username + ' restoring save mirror index=' + index + ' bytes=' + raw.length);
 	});
 
 	// ---- server-side save ----

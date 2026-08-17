@@ -52,6 +52,9 @@ PORT=8080 npm start
   它把模组的事件(`changeMap`、`updatePosition`、`updateAnimation`、`registerEntity`、
   `updateEntity*`、`throwBall`、`killEntity` 等)转发给同一地图上的其他用户。
 - `userUtilities.js` / `cmd.js` 提供辅助函数和一个可选的交互式控制台。
+- `persistence.js` 将账号、好友关系与云端存档保存在 `data/` 目录。自 **1.71.0**
+  起还会为每名玩家保留**最近 5 份不重复的存档镜像**;客户端的「镜像回溯」登录
+  流程可通过 `saveMirrorRestore` 流式恢复其中任意一份。
 - 服务器还会从本地 `./game` 目录在 `/data/*` 与 `/media/*` 路径下提供静态游戏文件
   (仅用于开发;正常作为中继使用时并不需要)。
 
