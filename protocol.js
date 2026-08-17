@@ -2024,8 +2024,15 @@ function handleConnection(socket) {
 		const partyId = party.partyOf(username);
 		const p = partyId && party.getParty(partyId);
 		const sync = p && p.storySync;
-		if (!sync || sync.leader !== username) return;
-		if (data && data.quest && data.quest !== sync.quest) return;
+		if (!sync || sync.leader !== username) {
+			console.log('[story-sync] cancel ignored: from=' + username + ' party=' + (partyId || '-')
+				+ ' sync=' + (sync ? ('leader=' + sync.leader + ' quest=' + sync.quest) : 'none'));
+			return;
+		}
+		if (data && data.quest && data.quest !== sync.quest) {
+			console.log('[story-sync] cancel quest mismatch: from=' + username + ' got=' + data.quest + ' sync=' + sync.quest);
+			return;
+		}
 		abortStoryVote(partyId, sync);
 		p.storySync = null;
 		const quest = sync.quest;
