@@ -2067,6 +2067,20 @@ function handleConnection(socket) {
 		}, username);
 	});
 
+	// 1.70.68: synchronized cutscene dialogue. Any party member pressing "next"
+	// on the current synced story dialogue relays the advance to everyone else;
+	// each client still runs its own local event, so the receiver calls its own
+	// message.onInteraction(). Light rate limit (humans press next every ~0.2s
+	// at fastest; 20/s is generous but still bounded).
+	socket.on('storySyncDialogNext', function () {
+		if (dropIfNotAuthed('storySyncDialogNext')) return;
+		if (rateLimited('storySyncDialogNext', 20)) return;
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		if (!p || !p.storySync) return;
+		emitToParty(partyId, 'storySyncDialogNext', { from: username, quest: p.storySync.quest }, username);
+	});
+
 	socket.on('partyRegroup', function (data) {
 		if (dropIfNotAuthed('partyRegroup')) return;
 		const partyId = party.partyOf(username);
