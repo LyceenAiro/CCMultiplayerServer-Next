@@ -1211,6 +1211,8 @@ function handleConnection(socket) {
 	// changed puzzle entities; the server whitelists the fields and broadcasts to
 	// the rest of the instance (sender excluded). `gone` lets peers kill a local
 	// copy that was destroyed on the sender (e.g. an ice pillar).
+	// 1.71.2: `own`/`ot` relay push/pull box grip ownership (empty own = release),
+	// and `pl`/`dl` relay PushPullDest plate state so a box sinks with its plate.
 	socket.on('puzzleState', function (data) {
 		if (dropIfNotAuthed('puzzleState')) return;
 		if (rateLimited('puzzleState', 20)) return;
@@ -1223,10 +1225,14 @@ function handleConnection(socket) {
 			if (e.gone === 1) clean.gone = 1;
 			if (Array.isArray(e.p) && e.p.length === 3
 				&& e.p.every((v) => typeof v === 'number' && isFinite(v) && Math.abs(v) <= 1e6)) clean.p = e.p.map(Math.round);
-			for (const k of ['on', 'hits', 'st', 'ph', 'act', 'mv', 'hd']) {
+			for (const k of ['on', 'hits', 'st', 'ph', 'act', 'mv', 'hd', 'pl', 'dl']) {
 				if (typeof e[k] === 'number' && isFinite(e[k])) clean[k] = Math.round(e[k]);
 			}
 			if (typeof e.anim === 'string' && e.anim.length <= 48) clean.anim = e.anim;
+			// 1.71.2: push/pull box grip ownership. '' is an explicit RELEASE and is
+			// forwarded like any other value; missing means "no ownership claim".
+			if (typeof e.own === 'string' && e.own.length <= 64) clean.own = e.own;
+			if (typeof e.ot === 'number' && isFinite(e.ot) && e.ot >= 0 && e.ot <= 1e15) clean.ot = Math.round(e.ot);
 			out.push(clean);
 		}
 		if (!out.length) return;

@@ -62,6 +62,8 @@ Then point the client's `config/config.json` at it, e.g.:
   `data/`. Since **1.71.0** it also keeps the **last five distinct save
   mirrors** per player; the client's 镜像回溯 (rollback) login flow can stream
   any one of them back via `saveMirrorRestore`.
+- Since **1.71.2** the `puzzleState` relay also whitelists push/pull box grip
+  ownership (`own` / `ot`) and push/pull destination plate flags (`pl` / `dl`).
 - The server also serves static game files from a local `./game` folder under
   `/data/*` and `/media/*` (used for development; not required for a normal
   relay).
