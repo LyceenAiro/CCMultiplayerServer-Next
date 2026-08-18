@@ -63,7 +63,9 @@ Then point the client's `config/config.json` at it, e.g.:
   mirrors** per player; the client's 镜像回溯 (rollback) login flow can stream
   any one of them back via `saveMirrorRestore`.
 - Since **1.71.2** the `puzzleState` relay also whitelists push/pull box grip
-  ownership (`own` / `ot`) and push/pull destination plate flags (`pl` / `dl`).
+  ownership (`own` / `ot`). From **1.71.3** the client treats PushPullDest /
+  already-placed box progress as per-player save state and no longer sends it
+  (the legacy `pl` / `dl` plate fields remain accepted but unused).
 - The server also serves static game files from a local `./game` folder under
   `/data/*` and `/media/*` (used for development; not required for a normal
   relay).
