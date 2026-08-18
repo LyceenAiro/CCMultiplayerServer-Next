@@ -70,6 +70,9 @@ Then point the client's `config/config.json` at it, e.g.:
   party is in **story-sync mode** it is forwarded to every online party member
   (cross-map); otherwise it only reaches the sender's map instance, so only
   same-map players get the kill credit.
+- Since **1.71.9** the `enemySoundStop` relay forwards the host's `STOP_SOUNDS`
+  action to the instance so looped enemy sounds (e.g. the buffalo charge
+  footsteps) are cut and never stack/leak.
 - The server also serves static game files from a local `./game` folder under
   `/data/*` and `/media/*` (used for development; not required for a normal
   relay).

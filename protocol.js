@@ -863,6 +863,17 @@ function handleConnection(socket) {
 		});
 	});
 
+	// ---- 1.71.9 (issue 7): STOP_SOUNDS relay for looped enemy sounds ----
+	// The host's engine ran ACTION_STEP.STOP_SOUNDS on a real enemy (e.g. the
+	// buffalo charge's looped buffalo-run.ogg). Members keep their own looping
+	// handle per uid; this tells them to cut it. Host-only like enemySound.
+	socket.on('enemySoundStop', function (data) {
+		if (dropIfNotAuthed('enemySoundStop')) return;
+		if (rateLimited('enemySoundStop', 60)) return;
+		if (!data || typeof data.uid !== 'number' || !Number.isInteger(data.uid) || data.uid <= 0) return;
+		world.broadcastHostState(ctx, username, 'enemySoundStop', { uid: data.uid });
+	});
+
 	// ---- round 34 (item 3): member relays ONE of its OWN player's attack sounds ----
 	// A remote player's attack sounds (the 5 melee-swing segments, the ball THROW) are
 	// played on an ig.ENTITY.Effect whose .target is the acting player, all global:false,
