@@ -73,6 +73,8 @@ Then point the client's `config/config.json` at it, e.g.:
 - Since **1.71.9** the `enemySoundStop` relay forwards the host's `STOP_SOUNDS`
   action to the instance so looped enemy sounds (e.g. the buffalo charge
   footsteps) are cut and never stack/leak.
+- **1.71.10** is a client-side QoL release (external-UI scale setting); the
+  protocol is unchanged, only the handshake version gate is bumped.
 - The server also serves static game files from a local `./game` folder under
   `/data/*` and `/media/*` (used for development; not required for a normal
   relay).
