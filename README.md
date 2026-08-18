@@ -66,6 +66,10 @@ Then point the client's `config/config.json` at it, e.g.:
   ownership (`own` / `ot`). From **1.71.3** the client treats PushPullDest /
   already-placed box progress as per-player save state and no longer sends it
   (the legacy `pl` / `dl` plate fields remain accepted but unused).
+- Since **1.71.7** the `questKill` relay carries quest kill-progress: when the
+  party is in **story-sync mode** it is forwarded to every online party member
+  (cross-map); otherwise it only reaches the sender's map instance, so only
+  same-map players get the kill credit.
 - The server also serves static game files from a local `./game` folder under
   `/data/*` and `/media/*` (used for development; not required for a normal
   relay).

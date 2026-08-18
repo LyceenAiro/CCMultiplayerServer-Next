@@ -983,6 +983,30 @@ function handleConnection(socket) {
 		world.broadcastHostState(ctx, username, 'loot', { uid: Math.round(data.uid), credit: Math.round(credit), boosterState, drops });
 	});
 
+	// ---- 1.71.7 (quest kill-progress sync) ----
+	// The client that emits this is the map-instance host that just completed a REAL
+	// enemy death chain (sc.combat.notifyCombatantDefeated), so ITS OWN quest KILL
+	// progress is already native — the sender is always excluded. Routing:
+	//   story-sync party active -> every other online party member (any member's
+	//                              kill counts, regardless of map);
+	//   otherwise               -> sender's instance only, which is exactly the
+	//                              "monster died on the same map" requirement.
+	// Payload is whitelisted: the engine enemyName (quest KILL subtask key) + the
+	// map the enemy died on (the receiver re-checks it against its own map).
+	socket.on('questKill', function (data) {
+		if (dropIfNotAuthed('questKill')) return;
+		if (rateLimited('questKill', 50)) return;
+		if (!data || typeof data.enemy !== 'string' || !/^[A-Za-z0-9_.-]{1,64}$/.test(data.enemy)) return;
+		if (typeof data.map !== 'string' || !data.map || data.map.length > 96) return;
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		if (p && p.storySync) {
+			emitToParty(partyId, 'questKill', { enemy: data.enemy, map: data.map }, username);
+		} else {
+			world.broadcastToInstance(ctx, username, 'questKill', { enemy: data.enemy, map: data.map });
+		}
+	});
+
 	socket.on('updateAnimation', function (data) {
 		if (dropIfNotAuthed('updateAnimation')) return;
 		if (!data) return;
