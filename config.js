@@ -6,10 +6,24 @@
 //
 // Config keys (config.json):
 //   monsterHpPerPlayer  extra max-HP fraction added to enemies per ADDITIONAL
-//                       party member. 0.5 = +50% HP per extra player, so a
-//                       3-player party faces enemies at x2.0 HP. Clients receive
+//                       party member. 0.7 = +70% HP per extra player, so a
+//                       3-player party faces enemies at x2.4 HP. Clients receive
 //                       this as `hpScale` in the handshakeResponse and apply it
 //                       using their own party roster size.
+//   monsterAttackPerPlayer / monsterDefensePerPlayer / monsterFocusPerPlayer
+//                       same scheme for the attack/defense/focus stats (default
+//                       0.1 = +10% per extra player). Sent as attackScale /
+//                       defenseScale / focusScale.
+//   monsterResistFlatPerPlayer
+//                       FLAT elemental-resistance increase per extra player, as
+//                       a fraction (0.1 = +10 percentage points resistance).
+//                       Default 0 = no adjustment. Sent as resistFlat.
+//   monsterResistPercentPerPlayer
+//                       PERCENTAGE elemental-resistance increase per extra
+//                       player; applies ONLY to positive resistance (elemFactor
+//                       below 1 after the flat boost) and never touches negative
+//                       resistance (weakness). Default 0 = no adjustment. Sent
+//                       as resistPercent.
 //   saveUploadKbS       per-socket save-UPLOAD bandwidth cap in kb/s (saveChunk
 //                       token bucket; the client paces itself at ~512 kb/s, well
 //                       under this). Range [1, 10240]; default 1024.
@@ -26,7 +40,12 @@ const path = require('path');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 
 const DEFAULTS = {
-	monsterHpPerPlayer: 0.5,
+	monsterHpPerPlayer: 0.7,
+	monsterAttackPerPlayer: 0.1,
+	monsterDefensePerPlayer: 0.1,
+	monsterFocusPerPlayer: 0.1,
+	monsterResistFlatPerPlayer: 0,
+	monsterResistPercentPerPlayer: 0,
 	saveUploadKbS: 1024,
 	saveDownloadKbS: 200,
 	port: 15151,
@@ -35,7 +54,7 @@ const DEFAULTS = {
 // Round 17: mod version. The server rejects any client whose mod version differs
 // (handshake gate in protocol.js). Bump this TOGETHER with the client mod version
 // (client src/multiplayer.ts MP_VERSION + package.json "version") on every release.
-const MOD_VERSION = '1.71.10';
+const MOD_VERSION = '1.72.0';
 
 function loadConfig() {
 	const cfg = Object.assign({}, DEFAULTS);
@@ -49,10 +68,20 @@ function loadConfig() {
 	} catch (e) {
 		console.warn('[config] failed to read ' + CONFIG_FILE + '; using defaults:', e.message);
 	}
-	// Clamp the multiplier to a sane, finite, non-negative range so a typo in the
-	// config file (a string, a negative, or Infinity) can't produce absurd HP factors.
-	const hp = Number(cfg.monsterHpPerPlayer);
-	cfg.monsterHpPerPlayer = (isFinite(hp) && hp >= 0 && hp <= 10) ? hp : DEFAULTS.monsterHpPerPlayer;
+	// Clamp the multipliers to a sane, finite, non-negative range so a typo in the
+	// config file (a string, a negative, or Infinity) can't produce absurd factors.
+	const clampFrac = (key, def, max) => {
+		const v = Number(cfg[key]);
+		return (isFinite(v) && v >= 0 && v <= max) ? v : def;
+	};
+	cfg.monsterHpPerPlayer = clampFrac('monsterHpPerPlayer', DEFAULTS.monsterHpPerPlayer, 10);
+	cfg.monsterAttackPerPlayer = clampFrac('monsterAttackPerPlayer', DEFAULTS.monsterAttackPerPlayer, 10);
+	cfg.monsterDefensePerPlayer = clampFrac('monsterDefensePerPlayer', DEFAULTS.monsterDefensePerPlayer, 10);
+	cfg.monsterFocusPerPlayer = clampFrac('monsterFocusPerPlayer', DEFAULTS.monsterFocusPerPlayer, 10);
+	// resFlat is a resistance FRACTION per extra player (1 = +100 points — capped
+	// there); resPercent is a multiplier fraction (10 = +1000%).
+	cfg.monsterResistFlatPerPlayer = clampFrac('monsterResistFlatPerPlayer', DEFAULTS.monsterResistFlatPerPlayer, 1);
+	cfg.monsterResistPercentPerPlayer = clampFrac('monsterResistPercentPerPlayer', DEFAULTS.monsterResistPercentPerPlayer, 10);
 	// Clamp the save bandwidth caps to a sane finite range [1, 10240] kb/s so a
 	// config typo can't turn the save stream into a firehose or a crawl.
 	const clampKbS = (key, def) => {
@@ -76,6 +105,10 @@ config.version = MOD_VERSION;
 console.log('[config] multiplayer mod v' + config.version +
 	' | monsterHpPerPlayer = ' + config.monsterHpPerPlayer +
 	' (monsters gain +' + (config.monsterHpPerPlayer * 100) + '% max HP per extra party member)' +
+	' | atk/def/foc per player = +' + (config.monsterAttackPerPlayer * 100) + '%/+' +
+		(config.monsterDefensePerPlayer * 100) + '%/+' + (config.monsterFocusPerPlayer * 100) + '%' +
+	' | resist flat/percent per player = +' + (config.monsterResistFlatPerPlayer * 100) + 'pt/+' +
+		(config.monsterResistPercentPerPlayer * 100) + '%' +
 	' | saveUploadKbS = ' + config.saveUploadKbS +
 	' | saveDownloadKbS = ' + config.saveDownloadKbS +
 	' | port = ' + config.port);

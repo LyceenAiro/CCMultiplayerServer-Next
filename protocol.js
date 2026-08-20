@@ -519,6 +519,14 @@ function handleConnection(socket) {
 			// Round 16: per-extra-party-member enemy HP multiplier the client applies
 			// using its own party roster size (config.json: monsterHpPerPlayer).
 			hpScale: config.monsterHpPerPlayer,
+			// Same scheme for attack/defense/focus (default +10% per extra player)
+			// and elemental resistance (flat points + positive-only percentage,
+			// both default 0 = no adjustment).
+			attackScale: config.monsterAttackPerPlayer,
+			defenseScale: config.monsterDefensePerPlayer,
+			focusScale: config.monsterFocusPerPlayer,
+			resistFlat: config.monsterResistFlatPerPlayer,
+			resistPercent: config.monsterResistPercentPerPlayer,
 			// Round 17: the accepted server version (harmless; useful for logs — the
 			// client already sent its own version in the handshake payload).
 			version: config.version,
@@ -728,6 +736,10 @@ function handleConnection(socket) {
 			df: (typeof s.df === 'number' && isFinite(s.df)) ? s.df : undefined,
 			fc: (typeof s.fc === 'number' && isFinite(s.fc)) ? s.fc : undefined,
 			ggt: (typeof s.ggt === 'number') ? s.ggt : undefined,
+			// Elemental status snapshot: [burn%, chill%, jolt%, mark%, activeMask] —
+			// charge as integer percent, mask bit i = status i active. Teammates'
+			// mirrors show the owner's real status bar + debuff FX from this.
+			st: (Array.isArray(s.st) && s.st.length === 5) ? s.st.map(function (v) { return (typeof v === 'number' && isFinite(v)) ? Math.max(0, Math.min(999, Math.round(v))) : 0; }) : undefined,
 		});
 	});
 	// ---- round 82: door-open visual sync ----
@@ -1057,6 +1069,30 @@ function handleConnection(socket) {
 		});
 	});
 
+	// ---- enemy action FX relay (charge-up telegraphs etc.) ----
+	// A whitelisted effect sheet spawned on a HOST-side real enemy (e.g. the
+	// snowman's coldMegaCharge windup). The enemy's action only runs on the host,
+	// so members' puppets never showed the charge glow. Relay {uid, sheet, key, p}
+	// like skillFx; members re-spawn it on the same-uid puppet. Host-only relay
+	// would be ideal, but a member can host their own map's enemies — the payload
+	// is harmless from any authed sender, so instance-broadcast like skillFx.
+	socket.on('enemyFx', function (data) {
+		if (dropIfNotAuthed('enemyFx')) return;
+		if (rateLimited('enemyFx', 50)) return;
+		if (!data || typeof data.sheet !== 'string' || typeof data.key !== 'string') return;
+		if (data.sheet.length > 64 || data.key.length > 64) return;
+		const uid = Number(data.uid);
+		if (!isFinite(uid) || uid <= 0) return;
+		world.broadcastToInstance(ctx, username, 'enemyFx', {
+			uid: Math.round(uid),
+			sheet: data.sheet,
+			key: data.key,
+			f: (data.f && typeof data.f.x === 'number' && typeof data.f.y === 'number' && typeof data.f.z === 'number')
+				? { x: data.f.x, y: data.f.y, z: data.f.z } : null,
+			p: (data.p && typeof data.p === 'object') ? data.p : {},
+		});
+	});
+
 	// ---- combat: host forwards an enemy-hit on a player's mirror to that player ----
 	// Enemies on the host can target a remote player's mirror entity (an Enemy-typed,
 	// party=PLAYER stand-in). The mirror's hp is owner-driven (the owner's playerState
@@ -1112,6 +1148,14 @@ function handleConnection(socket) {
 			// element on a combatHit) — attackElement is what showHitEffect needs to
 			// pick the connect sound (NEUTRAL+LIGHT etc.) + material hit-receive.
 			attackElement: typeof data.attackElement === 'number' && isFinite(data.attackElement) && data.attackElement >= 0 && data.attackElement <= 4 ? Math.round(data.attackElement) : undefined,
+			// Elemental STATUS buildup (the snowball chill etc.): the attack's raw
+			// statusInflict (stb), the ceiling-adjusted damageFactor (bdf) and the
+			// attacker's focus (afc). The victim's client re-runs the engine's own
+			// inflict formula against their REAL stats (statusInflict / elemFactor /
+			// COND_GUARD) so their status bar fills and the debuff truly applies.
+			stb: (typeof data.stb === 'number' && isFinite(data.stb) && data.stb !== 0 && Math.abs(data.stb) <= 100) ? data.stb : undefined, // <0 = pre-computed final amount (PvP path), applied directly
+			bdf: (typeof data.bdf === 'number' && isFinite(data.bdf) && data.bdf > 0 && data.bdf <= 100) ? data.bdf : undefined,
+			afc: (typeof data.afc === 'number' && isFinite(data.afc) && data.afc > 0 && data.afc <= 100000) ? Math.round(data.afc) : undefined,
 		});
 	});
 
@@ -1191,6 +1235,10 @@ function handleConnection(socket) {
 			weak: data.weak === true,
 			off: off,
 			def: def,
+			// Elemental status: the ATTACKER-side portion of the engine's inflict
+			// formula (damageFactor × statusInflict × focus-ratio × COND_EFFECT), so
+			// the host's real enemy accumulates burn/chill/etc. from member attacks.
+			stb: (typeof data.stb === 'number' && isFinite(data.stb) && data.stb > 0 && data.stb <= 100) ? data.stb : undefined,
 		});
 	});
 
@@ -1220,11 +1268,30 @@ function handleConnection(socket) {
 	// visual on its copy of the enemy. Same-instance relay like the other combat
 	// events (broadcastToInstance excludes the sender), auth-gated + rate-limited;
 	// the payload is whitelisted field-by-field ({uid, kind}), never a raw blob.
+	// 1.71.11: the host's relayed enemy telegraph effect ended (action end /
+	// CLEAR_EFFECTS -> Effect.stop). Members end their replayed copy — looping red
+	// glows (enemy/angry2 blinks forever otherwise). Same whitelist shape as enemyFx.
+	socket.on('enemyFxStop', function (data) {
+		if (dropIfNotAuthed('enemyFxStop')) return;
+		if (rateLimited('enemyFxStop', 50)) return;
+		if (!data || typeof data.sheet !== 'string' || typeof data.key !== 'string') return;
+		if (data.sheet.length > 64 || data.key.length > 64) return;
+		const uid = Number(data.uid);
+		if (!isFinite(uid) || uid <= 0) return;
+		world.broadcastToInstance(ctx, username, 'enemyFxStop', {
+			uid: Math.round(uid), sheet: data.sheet, key: data.key,
+		});
+	});
+
 	socket.on('combatFx', function (data) {
 		if (dropIfNotAuthed('combatFx')) return;
 		if (rateLimited('combatFx', 20)) return;
 		if (!data || typeof data.uid !== 'number' || !Number.isInteger(data.uid) || data.uid <= 0) return;
-		if (data.kind !== 'counter' && data.kind !== 'break') return;
+		// 1.71.11: 'ebreak:<DRAMATIC_EFFECT variant name>' = the HOST actually played
+		// an enemy break dramatic effect (e.g. meerkat reaction break) — replay it
+		// verbatim on members. Name validated against a strict whitelist shape.
+		if (data.kind !== 'counter' && data.kind !== 'break'
+			&& !(typeof data.kind === 'string' && /^ebreak:[A-Z_]{1,32}$/.test(data.kind))) return;
 		world.broadcastToInstance(ctx, username, 'combatFx', { from: username, uid: data.uid, kind: data.kind });
 	});
 
@@ -1240,6 +1307,38 @@ function handleConnection(socket) {
 		if (!data || typeof data.mapId !== 'number' || !Number.isInteger(data.mapId) || data.mapId <= 0) return;
 		if (typeof data.map !== 'string' || data.map.length === 0 || data.map.length > 128) return;
 		world.broadcastToInstance(ctx, username, 'plantBreak', { map: data.map, mapId: data.mapId });
+	});
+
+	// ---- ROUND 100: drop-pickup visibility relay ----
+	// A player obtained an item drop (monster kill or plant/prop destruction). The
+	// pickup animation (the drop falling, then flying into the player) only ever
+	// plays on the OWNER's client — relay it so every OTHER same-instance client
+	// can spawn a visual-only copy that flies to that player's mirror. Cosmetic
+	// only: no item grant rides on this packet (the real grant happened on the
+	// owner's client through the native chain / loot relay). Sender-excluded
+	// instance broadcast like itemUse; auth-gated + rate-limited; the payload is
+	// whitelisted field-by-field, never a raw blob.
+	socket.on('dropFx', function (data) {
+		if (dropIfNotAuthed('dropFx')) return;
+		if (rateLimited('dropFx', 40)) return;
+		if (!data) return;
+		const item = Number(data.item);
+		if (!isFinite(item) || item < 0 || item > 1000000) return;
+		let amount = Math.round(Number(data.amount));
+		if (!isFinite(amount) || amount < 1) return;
+		amount = Math.min(amount, 24);
+		const x = Number(data.x), y = Number(data.y), z = Number(data.z);
+		if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return;
+		if (Math.abs(x) > 1e6 || Math.abs(y) > 1e6 || Math.abs(z) > 1e6) return;
+		const kind = data.kind === 'prop' ? 'prop' : 'enemy';
+		// snd: 1 = the receiver's visual copy plays the catch jingle itself (the
+		// owner's grant was a silent addItem); 0/absent = silent (native drops relay
+		// their own jingle via playerSound already).
+		const snd = data.snd === 1 ? 1 : 0;
+		world.broadcastToInstance(ctx, username, 'dropFx', {
+			player: username, item: Math.round(item), amount,
+			x: Math.round(x), y: Math.round(y), z: Math.round(z), kind, snd,
+		});
 	});
 
 	// 1.71.0: dungeon puzzle-state relay. Any client sends a compact list of
@@ -2375,9 +2474,13 @@ function handleConnection(socket) {
 		if (dropIfNotAuthed('memberMap')) return;
 		if (rateLimited('memberMap', 5)) return;
 		const map = (data && typeof data.map === 'string') ? data.map.slice(0, 64) : '';
+		// World-map fix: the sender's engine-resolved AREA path. Map names do not
+		// always start with the area key ("autumn.path-3-1" is in area
+		// "autumn-area"), so receivers cannot derive it from the map name alone.
+		const area = (data && typeof data.area === 'string') ? data.area.slice(0, 64) : '';
 		const inst = world.getInstance(world.instanceOf(username));
 		if (inst) { if (!inst.memberMaps) inst.memberMaps = {}; inst.memberMaps[username] = map; }
-		world.broadcastToInstance(ctx, username, 'memberMap', { from: username, map: map });
+		world.broadcastToInstance(ctx, username, 'memberMap', { from: username, map: map, area: area });
 		// ROUND 30 (item 5): cross-instance map relay. broadcastToInstance only reaches
 		// members who share the sender's instance — once a member teleports to another
 		// map they STOP receiving the stayer's packets, so the stayer's HUD never
@@ -2393,10 +2496,10 @@ function handleConnection(socket) {
 				for (const m of p.members) {
 					if (m === username) continue;
 					const s = ctx.getSocket(m);
-					if (s) s.emit('memberMap', { from: username, map: map });
+					if (s) s.emit('memberMap', { from: username, map: map, area: area });
 				}
 			}
-			socket.emit('memberMap', { from: username, map: map });
+			socket.emit('memberMap', { from: username, map: map, area: area });
 		}
 	});
 

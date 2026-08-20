@@ -1,6 +1,11 @@
 {
-	"_comment": "monsterHpPerPlayer = extra max-HP fraction added to monsters per ADDITIONAL party member (0.5 = +50% HP per extra player; a 3-player party faces enemies at x2.0 HP). Clients receive this value as `hpScale` in the handshakeResponse and apply it using their own party roster size. Loaded at startup by config.js; a missing/broken file falls back to 0.5.\nsaveUploadKbS = per-socket save-UPLOAD bandwidth cap in kb/s (saveChunk token bucket; the client paces itself at ~512 kb/s, well under this). Range [1, 10240]; default 1024.\nsaveDownloadKbS = per-socket save-DOWNLOAD pacing in kb/s (the login save is streamed as 8192-char saveDownload parts at this rate). Range [1, 10240]; default 200.\nport = TCP port the server listens on. Range [1, 65535]; default 15151. The process.env.PORT environment variable, when set, overrides this.",
-	"monsterHpPerPlayer": 0.5,
+	"_comment": "monsterHpPerPlayer = extra max-HP fraction added to monsters per ADDITIONAL party member (0.7 = +70% HP per extra player; a 3-player party faces enemies at x2.4 HP). monsterAttackPerPlayer / monsterDefensePerPlayer / monsterFocusPerPlayer = same scheme for attack/defense/focus (default 0.1 = +10% per extra player). monsterResistFlatPerPlayer = FLAT elemental-resistance increase per extra player as a fraction (0.1 = +10 percentage points; default 0 = no adjustment). monsterResistPercentPerPlayer = PERCENTAGE resistance increase per extra player, applied ONLY to positive resistance (never to weaknesses; default 0 = no adjustment). Clients receive these as hpScale/attackScale/defenseScale/focusScale/resistFlat/resistPercent in the handshakeResponse and apply them with their own party roster size. saveUploadKbS = per-socket save-UPLOAD bandwidth cap in kb/s. Range [1, 10240]; default 1024. saveDownloadKbS = per-socket save-DOWNLOAD pacing in kb/s. Range [1, 10240]; default 200. port = TCP port the server listens on. Range [1, 65535]; default 15151. The process.env.PORT environment variable, when set, overrides this.",
+	"monsterHpPerPlayer": 0.7,
+	"monsterAttackPerPlayer": 0.1,
+	"monsterDefensePerPlayer": 0.1,
+	"monsterFocusPerPlayer": 0.1,
+	"monsterResistFlatPerPlayer": 0,
+	"monsterResistPercentPerPlayer": 0,
 	"saveUploadKbS": 1024,
 	"saveDownloadKbS": 200,
 	"port": 15151
