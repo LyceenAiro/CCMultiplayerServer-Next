@@ -278,6 +278,24 @@ function handleConnection(socket) {
 		return undefined;
 	}
 
+	// The main-story objective text ({lang: string} map) the leader ships inside
+	// its story state / start request so members can DISPLAY the party's current
+	// objective. Bounded hard: 12 langs x 300 chars.
+	function sanitizeStoryTaskLabel(raw) {
+		if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+		const clean = {};
+		let n = 0;
+		for (const k in raw) {
+			const v = raw[k];
+			if (typeof k === 'string' && k.length >= 1 && k.length <= 16
+				&& typeof v === 'string' && v.length >= 1 && v.length <= 300) {
+				clean[k] = v;
+				if (++n >= 12) break;
+			}
+		}
+		return n > 0 ? clean : undefined;
+	}
+
 	// Rebuild quest progress field-by-field. The member client applies ONLY this
 	// whitelisted {id,task,highest,finished,completed,labels} shape.
 	function sanitizeStoryQuestState(raw) {
@@ -299,6 +317,9 @@ function handleConnection(socket) {
 			completed: completed,
 			labels: (labels && typeof labels === 'object' && !Array.isArray(labels)) ? labels : {},
 		};
+		// Main-story mode: the leader's current objective text (member HUD display).
+		const ptask = sanitizeStoryTaskLabel(raw.ptask);
+		if (ptask) out.ptask = ptask;
 		// labels must map label names to booleans (the game only stores booleans).
 		for (const k in out.labels) {
 			if (typeof out.labels[k] !== 'boolean') return null;
@@ -1120,6 +1141,11 @@ function handleConnection(socket) {
 			// from the hit (full hit feedback, see client applyCombatHit).
 			ax: typeof data.ax === 'number' && isFinite(data.ax) ? data.ax : undefined,
 			ay: typeof data.ay === 'number' && isFinite(data.ay) ? data.ay : undefined,
+			// Lag-compensation anchor: the victim mirror's center at connect time.
+			// The victim's client drops monster verdicts that connected further away
+			// than the player could have moved within the round-trip window.
+			hx: typeof data.hx === 'number' && isFinite(data.hx) ? data.hx : undefined,
+			hy: typeof data.hy === 'number' && isFinite(data.hy) ? data.hy : undefined,
 			// Round 20: the attacker's attack stat so a guarding owner can apply the
 			// engine's PLAYER-shield damage reduction to the forwarded hit.
 			attack: typeof data.attack === 'number' && isFinite(data.attack) && data.attack > 0 ? data.attack : 0,
@@ -1295,6 +1321,38 @@ function handleConnection(socket) {
 		world.broadcastToInstance(ctx, username, 'combatFx', { from: username, uid: data.uid, kind: data.kind });
 	});
 
+	// playerFall: a party member genuinely fell into a fall terrain (water /
+	// hole / quicksand...). Replica terrain-falls are suppressed client-side
+	// (water-edge phantom-loop fix), so genuine falls need this explicit relay
+	// or teammates never see the splash + fall-damage visual. Party-scoped
+	// (mirrors exist only for party members), sender excluded.
+	socket.on('playerFall', function (data) {
+		if (dropIfNotAuthed('playerFall')) return;
+		if (rateLimited('playerFall', 10)) return;
+		const t = data && data.t;
+		if (typeof t !== 'number' || !Number.isInteger(t) || t < 1 || t > 32) return;
+		const fallPartyId = party.partyOf(username);
+		if (!fallPartyId) return;
+		emitToParty(fallPartyId, 'playerFall', { from: username, t }, username);
+	});
+
+	// cutsceneTrigger: a story-gated dungeon CUTSCENE EventTrigger (triggerType
+	// ONCE, real startCondition — e.g. the Temple Mine elevator console) started
+	// on this client. Same-block teammates gather onto the sender's exact
+	// position and replay the trigger. Instance-scoped (= same block), sender
+	// excluded; receivers self-validate map match + trigger freshness.
+	socket.on('cutsceneTrigger', function (data) {
+		if (dropIfNotAuthed('cutsceneTrigger')) return;
+		if (rateLimited('cutsceneTrigger', 5)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96) return;
+		if (typeof data.mi !== 'number' || !Number.isInteger(data.mi) || data.mi <= 0) return;
+		if (!Array.isArray(data.p) || data.p.length !== 3
+			|| !data.p.every((v) => typeof v === 'number' && isFinite(v) && Math.abs(v) <= 1e6)) return;
+		world.broadcastToInstance(ctx, username, 'cutsceneTrigger', {
+			from: username, map: data.map, mi: data.mi, p: data.p.map(Math.round),
+		});
+	});
+
 	// ---- ROUND 74: plant destruct sync ----
 	// Any instance client destroyed a map destructible (plant/bush/stone). Every OTHER
 	// same-instance client destroys its own intact copy at the same mapId (the map data
@@ -1371,6 +1429,32 @@ function handleConnection(socket) {
 		}
 		if (!out.length) return;
 		world.broadcastToInstance(ctx, username, 'puzzleState', { map: data.map, entries: out });
+	});
+
+	// ---- ROUND 132: player thrown-ball POSITION stream (bounce-puzzle visibility) ----
+	// throwBall relays a ball only at the MOMENT of the throw (its initial dir); once a
+	// bounce puzzle steers/resets the ball (BounceBlock.onBlockHit), teammates' one-shot
+	// replay no longer tracks it and the bouncing ball goes invisible. Each client
+	// streams the LIVE positions of its own thrown balls; receivers render a neutralized
+	// visual copy at the true spot. Any client -> same-instance others (like puzzleState).
+	socket.on('playerBall', function (data) {
+		if (dropIfNotAuthed('playerBall')) return;
+		if (rateLimited('playerBall', 90)) return; // balls stream at the block cadence (~30Hz)
+		if (!data || typeof data.map !== 'string' || data.map.length > 96 || !Array.isArray(data.entries)) return;
+		const num = (v) => (typeof v === 'number' && isFinite(v)) ? Math.round(v) : 0;
+		const out = [];
+		for (const e of data.entries) {
+			if (!e || typeof e !== 'object' || typeof e.i !== 'number') continue;
+			if (out.length >= 32) break;
+			out.push({
+				i: num(e.i),                          // the sender's ball uid
+				el: num(e.el),                        // sc.ELEMENT (0..4) -> ball tint
+				x: num(e.x), y: num(e.y), z: num(e.z),
+				vx: num(e.vx), vy: num(e.vy),         // 2D velocity (flight angle + dead-reckon)
+			});
+		}
+		if (!out.length) return;
+		world.broadcastToInstance(ctx, username, 'playerBall', { from: username, map: data.map, entries: out });
 	});
 
 	// ---- round 45 (Gap A, host origin): the HOST applied a member's forwarded hit to a
@@ -1495,9 +1579,16 @@ function handleConnection(socket) {
 		const partyId = party.partyOf(username);
 		if (!partyId) return; // solo -> the feature is party-only
 		for (const e of entries) {
-			if (party.markChestOpened(partyId, e.key, username)) {
-				world.broadcastToInstance(ctx, username, 'chestOpenedBy', { key: e.key, by: username });
-			}
+			party.markChestOpened(partyId, e.key, username);
+			// 1.72.0 (ghost-chest convergence): relay to the WHOLE party, not just
+			// the opener's instance — and even when the store already knew this open.
+			// A member standing on the chest's map who MISSED the original relay
+			// (party formed after the open, or the opener announced from another
+			// instance) otherwise keeps a stale ghost floating until someone
+			// re-enters the map. The relay is idempotent on clients (set-add) and
+			// the announce is rate-limited + 128-capped, so the extra traffic is
+			// negligible. Sender included: self-marking is harmless.
+			emitToParty(partyId, 'chestOpenedBy', { key: e.key, by: username });
 		}
 	});
 
@@ -1862,6 +1953,12 @@ function handleConnection(socket) {
 			socket.emit('partyActionResult', { action: 'accept', ok: false, error: 'Party no longer exists' });
 			return;
 		}
+		// 1.72.0: carry the party's cached bot roster to the new member (the old
+		// instance-cached replay on changeMap only existed for the host-scoped
+		// channel; the roster is party-scoped now).
+		if (p.partyBots && p.partyBots.bots && p.partyBots.bots.length) {
+			socket.emit('partyBots', { bots: p.partyBots.bots, maps: p.partyBots.maps || {} });
+		}
 		const joinedSync = p.storySync || null;
 		// ROUND 10: actively migrate every online member already on a map into the
 		// new party instance (solo:<u>:<map> -> party:<id>:<map>). The join path of
@@ -1908,6 +2005,8 @@ function handleConnection(socket) {
 				quest: joinedSync.quest,
 				leader: joinedSync.leader,
 				members: p.members.slice(),
+				plotLine: typeof joinedSync.plotLine === 'number' ? joinedSync.plotLine : undefined,
+				ptask: joinedSync.ptask,
 			});
 			const ls = accounts.getSocket(joinedSync.leader);
 			if (ls) ls.emit('storySyncResend', { quest: joinedSync.quest });
@@ -2027,10 +2126,12 @@ function handleConnection(socket) {
 				});
 				return;
 			}
-			p.storySync = { quest: rec.quest, leader: rec.leader, startedAt: Date.now(), eventSeq: 0, vote: null };
+			p.storySync = { quest: rec.quest, leader: rec.leader, startedAt: Date.now(), eventSeq: 0, vote: null, plotLine: rec.plotLine, ptask: rec.ptask };
 			console.log('[story-sync] started in ' + rec.partyId + ': quest=' + rec.quest + ' leader=' + rec.leader + ' members=' + p.members.join(','));
 			emitToParty(rec.partyId, 'storySyncStart', {
 				quest: rec.quest, leader: rec.leader, members: p.members.slice(),
+				plotLine: typeof rec.plotLine === 'number' ? rec.plotLine : undefined,
+				ptask: rec.ptask,
 			});
 		} else {
 			emitToParty(rec.partyId, 'storySyncStartFailed', {
@@ -2062,9 +2163,15 @@ function handleConnection(socket) {
 			return;
 		}
 		const reqId = 'ss' + (storyReqSeq++);
+		// Main-story mode: the leader piggybacks its current plot.line so the start
+		// envelope can clamp members whose own story is AHEAD of the leader the
+		// moment the mode begins (before the first state packet lands).
+		const plotLine = data && typeof data.plotLine === 'number' && isFinite(data.plotLine) && data.plotLine >= 0
+			? Math.min(STORY_SYNC.STATE_MAX_TASKS, Math.round(data.plotLine)) : undefined;
 		const rec = {
 			reqId, quest, partyId, leader: username, members: p.members.slice(),
-			answers: Object.create(null), settled: false, timer: null,
+			answers: Object.create(null), settled: false, timer: null, plotLine: plotLine,
+			ptask: sanitizeStoryTaskLabel(data && data.ptask),
 		};
 		rec.timer = setTimeout(function () {
 			const missing = rec.members.filter((m) => !rec.answers[m]);
@@ -2133,12 +2240,47 @@ function handleConnection(socket) {
 		if (!sync || sync.leader !== username) return;
 		const state = sanitizeStoryQuestState(data && data.state);
 		if (!state || state.id !== sync.quest) return;
+		// Track the leader's latest state position so a mid-way joiner's start
+		// envelope carries a CURRENT plotLine, not the stale request-time value.
+		sync.plotLine = state.task;
+		if (state.ptask) sync.ptask = state.ptask;
 		emitToParty(partyId, 'storySyncState', {
 			from: username,
 			quest: sync.quest,
 			state,
 			map: (data && typeof data.map === 'string' && data.map.length <= 64) ? data.map : '',
 		}, username);
+	});
+
+	// 1.72.0: map/tmp var relay for quest-world side effects (quest-gated chest /
+	// boss spawnConditions evaluate against these buckets). ANY synced member may
+	// legitimately write them: the leader (quest events), the host (world reactions
+	// like a boss-death trigger), or a member replaying a relayed event. Validated
+	// and relayed to the rest of the party; receivers write buckets directly so
+	// nothing echoes.
+	socket.on('storySyncMapVar', function (data) {
+		if (dropIfNotAuthed('storySyncMapVar')) return;
+		if (rateLimited('storySyncMapVar', 8)) return;
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		const sync = p && p.storySync;
+		if (!sync || !data || data.quest !== sync.quest) return;
+		if (p.members.indexOf(username) === -1) return;
+		if (!Array.isArray(data.list)) return;
+		const list = [];
+		for (const e of data.list.slice(0, 64)) {
+			if (!e || typeof e !== 'object') continue;
+			const b = e.b, k = e.k, v = e.v;
+			if (typeof b !== 'string' || typeof k !== 'string' || !k || k.length > 64 || k.indexOf('.') !== -1) continue;
+			if (b !== 'tmp' && !/^maps\.[A-Za-z0-9_.-]{1,80}$/.test(b)) continue;
+			const t = typeof v;
+			if (t !== 'number' && t !== 'boolean' && t !== 'string') continue;
+			if (t === 'number' && !isFinite(v)) continue;
+			if (t === 'string' && v.length > 128) continue;
+			list.push({ b, k, v });
+		}
+		if (!list.length) return;
+		emitToParty(partyId, 'storySyncMapVar', { quest: sync.quest, from: username, list }, username);
 	});
 
 	socket.on('storySyncEvent', function (data) {
@@ -2412,23 +2554,30 @@ function handleConnection(socket) {
 	// by the host; we just cap the relayed list at 8.
 	socket.on('partyBots', function (data) {
 		if (dropIfNotAuthed('partyBots')) return;
-		const instanceId = world.instanceOf(username);
-		if (!instanceId || !world.isHostOf(username, instanceId)) return;
+		// 1.72.0 (bot visibility regression fix): the roster used to be gated on the
+		// INSTANCE HOST and broadcast instance-wide. Bots belong to the party LEADER
+		// (botState is leader-driven for the same reason): a leader who was not the
+		// block's host — e.g. in a shared town, where the client also refused to
+		// publish — could never tell the party its bots existed, and teammates saw
+		// nothing. Gate on party leadership and relay to the party instead; the
+		// roster is cached on the party and replayed to late-joining members from
+		// completePartyAccept.
+		const partyId = party.partyOf(username);
+		const p = partyId && party.getParty(partyId);
+		if (!p || p.leader !== username) return;
 		let bots = (data && Array.isArray(data.bots)) ? data.bots : [];
 		bots = bots.filter((b) => typeof b === 'string' && b.length > 0 && b.length <= 32).slice(0, 8);
-		// Round 27 (item 2): `maps` tags each bot with the HOST's map so member HUDs
-		// can hide a bot's HP/SP/EXP bars + grey its net diamond while the bot (its
-		// owner) is off the member's map. Sanitized to {botName: mapName}. Cached on
-		// the instance so the replayed (late-joiner) broadcast keeps the maps.
+		// Round 27 (item 2): `maps` tags each bot with the owner's map so member
+		// HUDs can hide a bot's HP/SP/EXP bars + grey its net diamond while the bot
+		// (its owner) is off the member's map. Sanitized to {botName: mapName}.
 		let maps = {};
 		if (data && data.maps && typeof data.maps === 'object') {
 			for (const k in data.maps) {
 				if (typeof data.maps[k] === 'string' && data.maps[k].length <= 64) maps[k] = data.maps[k];
 			}
 		}
-		const inst = world.getInstance(instanceId);
-		if (inst) { inst.bots = bots; inst.botMaps = maps; }
-		world.broadcastToInstance(ctx, username, 'partyBots', { bots: bots, maps: maps });
+		p.partyBots = bots.length ? { bots: bots, maps: maps } : null;
+		emitToParty(partyId, 'partyBots', { bots: bots, maps: maps }, username);
 	});
 
 	// ---- round 13: party LEADER streams live bot state (pos/anim/hp/level) ----

@@ -242,12 +242,6 @@ World.prototype.changeMap = function (ctx, username, mapName, areaType, pos) {
 			if (prof) ctx.getSocket(username).emit('updatePlayerProfile', { player: name, profile: prof });
 		}
 	}
-	// Round 11: replay the host's party-bot roster so late joiners see the bots.
-	// Round 27 (item 2): carry the cached per-bot maps so the off-map HUD hide/grey
-	// works for a late joiner too (botMaps is set by the same broadcast that cached bots).
-	if (!isHost && inst.bots && inst.bots.length) {
-		ctx.getSocket(username).emit('partyBots', { bots: inst.bots, maps: inst.botMaps || {} });
-	}
 
 	// Round 20: push the party's opened-chest snapshot for the JOINED map (filtered
 	// to this map's prefix to keep the payload small) so the newcomer immediately
