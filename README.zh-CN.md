@@ -2,17 +2,17 @@
 
 > [English README](README.md) | 中文版本
 
-[![Discord Server](https://img.shields.io/discord/382339402338402315.svg?label=Discord%20Server)](https://discord.gg/SJmMZKy)
+[![Discord Server](<https://img.shields.io/discord/382339402338402315.svg?label=Discord%20Server>)](https://discord.gg/SJmMZKy)
 
 CrossCode 多人模组
-[CCMultiplayerClient](https://github.com/CCDirectLink/CCMultiplayerClient)
+[CCMultiplayerClient](https://github.com/LyceenAiro/CCMultiplayerClient)
 的**中继服务器**。
 
 它是一个小型的 Node.js + socket.io **消息中继**:客户端之间从不直接通信,
 所有的位置/动画/实体更新都先发送到这里,再转发给同一地图上的其他玩家。
 服务器还负责选举**主机**(第一个连接的客户端),并在主机掉线时处理**主机迁移**。
 
-> **当前状态:与复活后的客户端兼容。** 服务器与游戏版本无关 ——
+> **当前状态:详见客户端。** 服务器与游戏版本无关 ——
 > 网络协议在 CrossCode 1.1.0 与 1.4.2 之间没有变化,因此针对 1.4.2 / CCLoader v2 的适配
 > **无需改动任何代码**。已用 `socket.io-client@4.8.x` 通过一次真实握手测试重新验证。
 

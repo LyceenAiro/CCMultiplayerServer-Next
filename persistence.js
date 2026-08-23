@@ -137,6 +137,30 @@ Persistence.prototype.saveGame = function (username, slot, data) {
 	}
 };
 
+// 1.73.0 (admin import / mirror-switch): replace ONLY the main save (autoSlot)
+// without pushing anything into the mirror ring — the admin API contract is that
+// importing/switching never perturbs the mirrors. Returns true on success.
+Persistence.prototype.setMainSave = function (username, data) {
+	if (typeof data !== 'string' || !data) return false;
+	const file = saveFileFor(username);
+	let existing = {};
+	try {
+		if (fs.existsSync(file)) existing = JSON.parse(fs.readFileSync(file, 'utf8'));
+	} catch (e) { /* overwrite */ }
+	if (!existing || typeof existing !== 'object') existing = {};
+	existing.autoSlot = data;
+	existing.updatedAt = new Date().toISOString();
+	try {
+		const tmp = file + '.tmp';
+		fs.writeFileSync(tmp, JSON.stringify(existing, null, '\t'));
+		fs.renameSync(tmp, file);
+		return true;
+	} catch (e) {
+		console.error('[persistence] setMainSave failed for ' + username + ':', e.message);
+		return false;
+	}
+};
+
 // 1.71.0: metadata only (newest first) for the client's rollback picker. The raw
 // mirror data stays on disk until loadSaveMirror asks for one entry.
 Persistence.prototype.listSaveMirrors = function (username) {

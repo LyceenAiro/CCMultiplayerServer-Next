@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CC 联机服务器管理</title>
+<style>
+/* ===== CrossWorlds 科幻 HUD 主题 ===== */
+:root {
+  --bg:#070b16; --panel:#101a30; --line:#27405f; --line-hi:#3f6ea6;
+  --fg:#dce8fa; --dim:#7f95b8;
+  --cyan:#4fc8ff; --cyan-dim:rgba(79,200,255,.35);
+  --orange:#ffa52e; --orange-hi:#ffc46b;
+  --ok:#4fe08a; --bad:#ff5f6e;
+}
+* { box-sizing:border-box; }
+html, body { height:100%; }
+body {
+  margin:0; overflow:hidden; color:var(--fg);
+  font:14px/1.55 "Segoe UI","Microsoft YaHei",sans-serif;
+  background:
+    radial-gradient(1100px 550px at 85% -10%, rgba(79,200,255,.09), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(255,165,46,.05), transparent 55%),
+    linear-gradient(160deg,#0a1122 0%,#070b16 55%,#05080f 100%);
+  background-attachment:fixed;
+}
+body::before { /* 全息网格 */
+  content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+  background:
+    repeating-linear-gradient(0deg, rgba(79,200,255,.030) 0 1px, transparent 1px 44px),
+    repeating-linear-gradient(90deg, rgba(79,200,255,.030) 0 1px, transparent 1px 44px);
+}
+body::after { /* 扫描线 */
+  content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+  background:repeating-linear-gradient(0deg, rgba(255,255,255,.016) 0 1px, transparent 1px 3px);
+}
+
+/* ===== 顶栏 ===== */
+header {
+  position:relative; z-index:1; height:52px; padding:0 18px;
+  display:flex; align-items:center; gap:14px;
+  background:linear-gradient(180deg, rgba(18,28,52,.92), rgba(11,18,36,.92));
+  border-bottom:1px solid var(--line);
+}
+header::after { /* 底缘能量线 */
+  content:""; position:absolute; left:0; right:0; bottom:-1px; height:2px;
+  background:linear-gradient(90deg, var(--orange), var(--cyan) 45%, transparent 80%);
+}
+header h1 { margin:0; font-size:15px; font-weight:700; letter-spacing:.16em; display:flex; align-items:center; }
+header h1 .tick {
+  width:10px; height:10px; margin-right:11px; transform:skewX(-18deg);
+  background:linear-gradient(135deg, var(--orange-hi), var(--orange));
+  box-shadow:0 0 9px rgba(255,165,46,.75);
+  animation:tickPulse 2.6s ease-in-out infinite;
+}
+@keyframes tickPulse { 0%,100% { box-shadow:0 0 5px rgba(255,165,46,.45); } 50% { box-shadow:0 0 12px rgba(255,165,46,.95); } }
+header .ver {
+  color:var(--dim); font:11px/1 Consolas,monospace; letter-spacing:.08em;
+  padding:4px 9px; border:1px solid var(--line); border-radius:2px; background:rgba(8,14,28,.7);
+}
+header .spacer { flex:1; }
+
+main { position:relative; z-index:1; display:flex; height:calc(100vh - 52px); }
+
+/* ===== 左侧玩家列表 ===== */
+#listPanel {
+  width:300px; flex:none; display:flex; flex-direction:column;
+  border-right:1px solid var(--line); background:rgba(8,13,26,.55);
+}
+.searchWrap { padding:12px 12px 10px; border-bottom:1px solid rgba(39,64,95,.55); }
+.searchWrap input { width:100%; }
+#list { flex:1; overflow-y:auto; padding:10px 12px 14px; }
+#list > .dim { padding:8px 2px; letter-spacing:.06em; }
+
+.player {
+  position:relative; cursor:pointer; margin-bottom:8px; padding:9px 12px;
+  border:1px solid var(--line); border-left:3px solid transparent; border-radius:3px;
+  background:linear-gradient(180deg, rgba(19,29,53,.72), rgba(12,19,37,.72));
+  transition:border-color .12s ease, background .12s ease;
+}
+.player:hover { border-color:var(--line-hi); background:linear-gradient(180deg, rgba(26,39,70,.8), rgba(15,24,46,.8)); }
+.player.sel {
+  border-color:var(--cyan); border-left-color:var(--orange);
+  background:linear-gradient(90deg, rgba(255,165,46,.10), rgba(79,200,255,.07) 45%, rgba(15,24,46,.85));
+  box-shadow:0 0 0 1px rgba(79,200,255,.30), 0 0 18px rgba(79,200,255,.10);
+}
+.player .nm { font-weight:600; letter-spacing:.03em; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.player .sub { margin-top:3px; color:var(--dim); font-size:11px; letter-spacing:.03em; }
+
+.badge {
+  display:inline-flex; align-items:center; gap:5px; padding:2px 8px;
+  font-size:11px; letter-spacing:.10em; border-radius:2px; border:1px solid; white-space:nowrap;
+}
+.badge.on { color:var(--ok); border-color:rgba(79,224,138,.45); background:rgba(79,224,138,.08); }
+.badge.on::before { content:""; width:5px; height:5px; border-radius:50%; background:var(--ok); box-shadow:0 0 6px var(--ok); }
+.badge.off { color:var(--dim); border-color:rgba(127,149,184,.30); background:rgba(127,149,184,.06); }
+.badge.off::before { content:""; width:5px; height:5px; border-radius:50%; background:var(--dim); opacity:.55; }
+
+/* ===== 右侧详情区 ===== */
+#detail { flex:1; overflow-y:auto; padding:22px 28px 40px; }
+#detail > * { max-width:960px; }
+#detail > .dim:only-child { margin-top:60px; text-align:center; letter-spacing:.12em; }
+#detail > .panel, #detail > h2, #detail > #msg { animation:panelIn .18s ease-out; }
+@keyframes panelIn { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:none; } }
+
+h2 { margin:0 0 14px; font-size:19px; letter-spacing:.06em; display:flex; align-items:center; gap:12px; }
+
+.panel {
+  position:relative; margin-bottom:16px; padding:14px 18px 16px;
+  background:linear-gradient(180deg, rgba(21,32,58,.82), rgba(12,19,37,.82));
+  border:1px solid var(--line); border-radius:4px;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.03), 0 5px 20px rgba(0,0,0,.35);
+}
+.panel::before { /* 左上号角标 */
+  content:""; position:absolute; left:-1px; top:-1px; width:14px; height:14px;
+  border-left:2px solid var(--cyan); border-top:2px solid var(--cyan);
+  border-top-left-radius:4px; opacity:.85; pointer-events:none;
+}
+.panel::after { /* 右下号角标 */
+  content:""; position:absolute; right:-1px; bottom:-1px; width:14px; height:14px;
+  border-right:2px solid var(--cyan); border-bottom:2px solid var(--cyan);
+  border-bottom-right-radius:4px; opacity:.85; pointer-events:none;
+}
+.panel > b { /* 区块标题：斜块 + 大写科技感 */
+  display:inline-flex; align-items:center; gap:9px;
+  font-size:12px; font-weight:700; letter-spacing:.20em; color:var(--cyan);
+}
+.panel > b::before {
+  content:""; width:8px; height:8px; transform:skewX(-18deg);
+  background:linear-gradient(135deg, var(--orange-hi), var(--orange));
+  box-shadow:0 0 7px rgba(255,165,46,.65);
+}
+
+table.kv { border-collapse:collapse; margin-top:2px; }
+table.kv td { padding:5px 30px 5px 0; vertical-align:top; }
+table.kv td.k { color:var(--dim); font-size:12px; letter-spacing:.08em; white-space:nowrap; padding-top:7px; }
+
+.row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:10px 0; }
+
+/* ===== 按钮：切角 + 能量渐变 ===== */
+button {
+  height:30px; padding:0 16px; border:0; cursor:pointer;
+  font:600 12px/1 "Segoe UI","Microsoft YaHei",sans-serif; letter-spacing:.10em;
+  color:#20130a; background:linear-gradient(180deg, var(--orange-hi), var(--orange));
+  clip-path:polygon(7px 0, 100% 0, 100% calc(100% - 7px), calc(100% - 7px) 100%, 0 100%, 0 7px);
+  transition:filter .12s ease, transform .06s ease;
+}
+button:hover { filter:brightness(1.12) drop-shadow(0 0 8px rgba(255,165,46,.35)); }
+button:active { transform:translateY(1px); }
+button:focus-visible { outline:1px solid var(--cyan); outline-offset:2px; }
+button.ghost {
+  color:var(--fg);
+  background:linear-gradient(180deg, rgba(79,200,255,.13), rgba(79,200,255,.05));
+  box-shadow:inset 0 0 0 1px var(--cyan-dim);
+}
+button.ghost:hover { filter:brightness(1.25) drop-shadow(0 0 8px rgba(79,200,255,.25)); }
+
+/* ===== 输入控件 ===== */
+input, select {
+  height:30px; padding:0 10px;
+  background:#0a1224; color:var(--fg);
+  border:1px solid var(--line); border-radius:3px;
+  font:13px/1 "Segoe UI","Microsoft YaHei",sans-serif; letter-spacing:.02em;
+  transition:border-color .12s ease, box-shadow .12s ease;
+}
+input:focus, select:focus {
+  outline:none; border-color:var(--cyan);
+  box-shadow:0 0 0 1px var(--cyan-dim), 0 0 14px rgba(79,200,255,.16);
+}
+input::placeholder { color:#506486; }
+input[type=number] { font-family:Consolas,monospace; }
+select { cursor:pointer; }
+select option { background:#0b1426; }
+
+/* ===== 消息条 ===== */
+#msg {
+  position:relative; margin:0 0 16px; padding:10px 14px 10px 38px;
+  border:1px solid; border-radius:3px; display:none; white-space:pre-wrap; letter-spacing:.02em;
+}
+#msg.ok { display:block; background:rgba(79,224,138,.07); border-color:rgba(79,224,138,.40); color:var(--ok); }
+#msg.ok::before { content:"✓"; position:absolute; left:14px; top:10px; font-weight:700; }
+#msg.err { display:block; background:rgba(255,95,110,.07); border-color:rgba(255,95,110,.42); color:var(--bad); }
+#msg.err::before { content:"✕"; position:absolute; left:14px; top:10px; font-weight:700; }
+
+/* ===== 镜像存档 ===== */
+.mirror {
+  display:flex; align-items:center; gap:14px; padding:8px 14px; margin-bottom:8px;
+  border:1px solid var(--line); border-radius:3px; background:rgba(9,15,30,.6);
+  transition:border-color .12s ease;
+}
+.mirror:hover { border-color:var(--line-hi); }
+.mirror .idx { color:var(--orange); font:700 12px/1 Consolas,monospace; letter-spacing:.06em; }
+
+/* ===== 物品搜索下拉 ===== */
+#itemResults {
+  position:absolute; top:calc(100% + 6px); left:0; z-index:10; display:none;
+  width:360px; max-height:280px; overflow-y:auto;
+  background:#0b1428; border:1px solid var(--line-hi); border-radius:3px;
+  box-shadow:0 12px 30px rgba(0,0,0,.65), 0 0 0 1px rgba(79,200,255,.12), 0 0 24px rgba(79,200,255,.10);
+}
+#itemResults .it { padding:8px 12px; cursor:pointer; border-bottom:1px solid rgba(39,64,95,.45); letter-spacing:.02em; }
+#itemResults .it:last-child { border-bottom:0; }
+#itemResults .it:hover { background:rgba(79,200,255,.10); }
+#itemResults .it.nohit { color:var(--dim); cursor:default; pointer-events:none; }
+#itemResults .it .id { margin-left:8px; color:var(--dim); font:11px/1 Consolas,monospace; }
+
+.dim { color:var(--dim); font-size:12px; letter-spacing:.03em; }
+.tip { border-bottom:1px dashed rgba(127,149,184,.65); cursor:help; transition:color .12s ease, border-color .12s ease; }
+.tip:hover { color:var(--cyan); border-bottom-color:var(--cyan); }
+
+/* ===== 装备属性悬浮窗 ===== */
+#tooltip {
+  position:fixed; z-index:99; display:none; min-width:190px; padding:12px 16px;
+  background:linear-gradient(180deg,#0d1730,#0a1122);
+  border:1px solid var(--cyan-dim); border-radius:3px; pointer-events:none; font-size:13px;
+  box-shadow:0 12px 32px rgba(0,0,0,.7), 0 0 20px rgba(79,200,255,.12);
+}
+#tooltip .tname { font-weight:700; color:var(--orange-hi); letter-spacing:.04em; margin-bottom:2px; }
+#tooltip .tmeta { color:var(--dim); font-size:11px; letter-spacing:.06em; margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid rgba(39,64,95,.6); }
+#tooltip .stat { display:flex; justify-content:space-between; gap:20px; padding:1px 0; }
+#tooltip .stat .v { font-weight:600; font-family:Consolas,monospace; }
+#tooltip .stat .v.up { color:var(--ok); }
+#tooltip .stat .v.down { color:var(--bad); }
+
+/* ===== 滚动条 ===== */
+::-webkit-scrollbar { width:10px; height:10px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:#22395c; border-radius:5px; border:2px solid #070b16; }
+::-webkit-scrollbar-thumb:hover { background:#31527f; }
+
+@media (max-width: 920px) { #listPanel { width:240px; } #detail { padding:16px 18px 32px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="tick"></span>CC 联机服务器管理</h1>
+  <span class="ver" id="verInfo"></span>
+  <span class="spacer"></span>
+  <button class="ghost" onclick="refreshAll()">⟳ 刷新</button>
+</header>
+<main>
+  <div id="listPanel">
+    <div class="searchWrap"><input id="playerSearch" placeholder="搜索玩家（模糊）…" oninput="renderList()"></div>
+    <div id="list"><div class="dim">加载中…</div></div>
+  </div>
+  <div id="detail"><div class="dim">← 选择左侧玩家查看详情</div></div>
+</main>
+<div id="tooltip"></div>
+<script>
+var TOKEN = localStorage.getItem('mpAdminToken') || '';
+var players = [];
+var current = null;
+var detail = null;
+var itemdb = [];
+var teleports = [];
+var pickedItem = null;
+var godState = {}; // 玩家名 -> 无敌模式最后已知状态（本页内存，仅会话）
+
+async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({ 'x-admin-token': TOKEN }, opts.headers || {});
+  if (opts.body && typeof opts.body !== 'string') {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(opts.body);
+  }
+  var r = await fetch('/admin/api' + path, opts);
+  var j = await r.json().catch(function(){ return { ok:false, msg:'响应解析失败' }; });
+  if (r.status === 401) { if (!opts.quiet) askToken(true); throw new Error('unauthorized'); }
+  return j;
+}
+function askToken(force) {
+  var t = prompt(force ? 'Token 错误，请重新输入管理令牌 (adminToken)：' : '请输入管理令牌 (adminToken)：', TOKEN);
+  if (t !== null) { TOKEN = t.trim(); localStorage.setItem('mpAdminToken', TOKEN); refreshAll(); }
+}
+function showMsg(ok, text) {
+  var m = document.getElementById('msg');
+  if (!m) return;
+  m.className = ok ? 'ok' : 'err';
+  m.textContent = text;
+}
+function fmtTime(ts) { if (!ts) return '—'; return new Date(ts).toLocaleString('zh-CN'); }
+function fmtPlaytime(s) {
+  if (!s) return '0 小时 0 分';
+  return Math.floor(s / 3600) + ' 小时 ' + Math.floor((s % 3600) / 60) + ' 分';
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+
+async function refreshAll() {
+  try {
+    var j = await api('/players');
+    players = j.players || [];
+    sortPlayers();
+    renderList();
+    if (current) await loadDetail(encodeURIComponent(current));
+  } catch (e) {
+    if (String(e.message) !== 'unauthorized') document.getElementById('list').innerHTML = '<div class="dim">连接失败</div>';
+  }
+  try { var v = await fetch('/version').then(function(r){ return r.json(); }); document.getElementById('verInfo').textContent = 'mod v' + v.version; } catch (e) {}
+  try { var d = await api('/itemdb'); itemdb = d.items || []; } catch (e) {}
+  try { var t = await api('/teleports'); teleports = t.teleports || []; } catch (e) {}
+}
+
+function renderList() {
+  var el0 = document.getElementById('list');
+  var st0 = el0 ? el0.scrollTop : 0; // 保留滚动位置，热更新不打断浏览
+  renderListInner();
+  var el1 = document.getElementById('list');
+  if (el1) el1.scrollTop = st0;
+}
+function renderListInner() {
+  var el = document.getElementById('list');
+  var qEl = document.getElementById('playerSearch');
+  var q = qEl ? qEl.value.trim() : '';
+  var shown = players;
+  if (q) {
+    var scored = [];
+    for (var i = 0; i < players.length; i++) {
+      var s = fuzzyScore(players[i].name, q);
+      if (s >= 0) scored.push({ p: players[i], score: s });
+    }
+    scored.sort(function(a, b){ return b.score - a.score; });
+    shown = scored.map(function(x){ return x.p; });
+  }
+  if (!shown.length) { el.innerHTML = '<div class="dim">' + (q ? '无匹配玩家' : '暂无玩家') + '</div>'; return; }
+  el.innerHTML = shown.map(function(p){
+    return '<div class="player' + (p.name === current ? ' sel' : '') + '" onclick="loadDetail(\'' + encodeURIComponent(p.name) + '\')">' +
+      '<div class="nm">' + esc(p.name) + ' <span class="badge ' + (p.online ? 'on' : 'off') + '">' + (p.online ? '在线' : '离线') + '</span></div>' +
+      '<div class="sub">存档更新：' + fmtTime(p.updatedAt) + '</div></div>';
+  }).join('');
+}
+
+// ---- 列表排序与状态热更新（静默轮询，不触碰详情区输入） ----
+// 排序：在线玩家在前；同组内按存档更新时间，新的在前
+function sortPlayers() {
+  players.sort(function(a, b){
+    var onA = a.online ? 1 : 0, onB = b.online ? 1 : 0;
+    if (onA !== onB) return onB - onA;
+    var tA = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+    var tB = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+    if (tA !== tB) return tB - tA;
+    return String(a.name).localeCompare(String(b.name));
+  });
+}
+// 列表内容指纹：内容没变就不重建 DOM，避免闪烁/打断
+function listKey() {
+  return players.map(function(p){ return p.name + (p.online ? '1' : '0') + (p.updatedAt || ''); }).join('|');
+}
+// 仅就地更新详情页头部的在线徽章（不重绘详情，不影响正在输入的内容）
+function updateDetailBadge() {
+  if (!current) return;
+  var badge = document.querySelector('#detail h2 .badge');
+  if (!badge) return;
+  for (var i = 0; i < players.length; i++) {
+    if (players[i].name !== current) continue;
+    badge.className = 'badge ' + (players[i].online ? 'on' : 'off');
+    badge.textContent = players[i].online ? '在线' : '离线';
+    return;
+  }
+}
+var polling = false;
+async function pollPlayers() {
+  if (polling || !TOKEN || document.hidden) return; // 请求进行中 / 未登录 / 标签页隐藏时跳过
+  polling = true;
+  try {
+    var j = await api('/players', { quiet: true });
+    var before = listKey();
+    players = j.players || [];
+    sortPlayers();
+    if (listKey() !== before) { renderList(); updateDetailBadge(); }
+  } catch (e) { /* 轮询静默失败，绝不打断当前操作 */ }
+  polling = false;
+}
+
+async function loadDetail(encName) {
+  var name = decodeURIComponent(encName);
+  current = name;
+  renderList();
+  var j = await api('/player/' + encodeURIComponent(name));
+  if (!j.ok) { showMsg(false, j.msg); return; }
+  detail = j;
+  renderDetail();
+}
+
+function eqRow(eq, label, slot) {
+  var cell = '—';
+  if (eq[slot]) {
+    cell = '<span class="tip" data-item="' + eq[slot].id + '">' + esc(eq[slot].name || ('未知 #' + eq[slot].id)) + '</span> <span class="dim">#' + eq[slot].id + '</span>';
+  }
+  return '<tr><td class="k">' + label + '</td><td>' + cell + '</td></tr>';
+}
+
+function renderDetail() {
+  var d = detail, s = d.save, p = (s && s.player) || {};
+  var html = '<div id="msg"></div>';
+  html += '<h2>' + esc(d.name) + ' <span class="badge ' + (d.online ? 'on' : 'off') + '">' + (d.online ? '在线' : '离线') + '</span></h2>';
+  if (!s) html += '<div class="dim">该玩家还没有主存档</div>';
+  else if (s.corrupt) html += '<div class="dim">主存档无法解析（可能损坏）</div>';
+  else {
+    var eq = p.equip || {};
+    html += '<div class="panel"><table class="kv">' +
+      '<tr><td class="k">等级</td><td>' + (p.level != null ? p.level : '—') + '</td><td class="k">经验</td><td>' + (p.exp != null ? p.exp : '—') + '</td></tr>' +
+      '<tr><td class="k">信用点</td><td>' + (p.credit != null ? p.credit : '—') + '</td><td class="k">HP</td><td>' + (p.hp != null ? p.hp : '—') + '</td></tr>' +
+      '<tr><td class="k">SP 等级</td><td>' + (p.spLevel != null ? p.spLevel : '—') + '</td><td class="k">章节</td><td>' + (s.chapter != null ? s.chapter : '—') + '</td></tr>' +
+      '<tr><td class="k">当前地图</td><td>' + esc(s.map || '—') + '</td><td class="k">游戏时长</td><td>' + fmtPlaytime(s.playtime) + '</td></tr>' +
+      '</table></div>';
+    html += '<div class="panel"><b>装备</b><table class="kv" style="margin-top:6px">' +
+      eqRow(eq, '头部', 'head') + eqRow(eq, '左臂', 'leftArm') + eqRow(eq, '右臂', 'rightArm') + eqRow(eq, '躯干', 'torso') + eqRow(eq, '足部', 'feet') +
+      '</table></div>';
+  }
+  html += '<div class="panel"><b>镜像存档（回档点，最新在前）</b><div style="margin-top:8px">';
+  if (d.mirrors && d.mirrors.length) {
+    html += d.mirrors.map(function(m){
+      return '<div class="mirror"><span class="idx">#' + m.index + '</span><span>' + fmtTime(m.at) + '</span>' +
+        '<span class="dim">' + (m.bytes / 1024).toFixed(1) + ' KB</span>' +
+        '<span style="flex:1"></span><button onclick="switchMirror(' + m.index + ')">切换到此镜像</button></div>';
+    }).join('');
+  } else html += '<div class="dim">暂无镜像</div>';
+  html += '</div></div>';
+  html += '<div class="panel"><b>存档操作</b><div class="row" style="margin-top:8px">' +
+    '<button class="ghost" onclick="exportSave()">⬇ 导出主存档</button>' +
+    '<input type="file" id="importFile" accept=".json" style="display:none" onchange="importSave(this)">' +
+    '<button class="ghost" onclick="document.getElementById(\'importFile\').click()">⬆ 导入主存档</button>' +
+    '<span class="dim">导入/导出均只涉及主存档，镜像不受影响</span></div>' +
+    '<div class="row"><input id="renameInput" placeholder="新玩家名" style="width:180px">' +
+    '<button class="ghost" onclick="renamePlayer()">✏ 修改玩家名</button></div></div>';
+  html += '<div class="panel"><b>调试工具</b> <span class="dim">（需要玩家在线）</span>';
+  var godOn = !!godState[d.name];
+  html += '<div class="row" style="margin-top:8px"><input id="expAmt" type="number" placeholder="经验值" style="width:110px"><button onclick="give(\'giveExp\',\'expAmt\')">给予经验</button>' +
+    '<input id="creditAmt" type="number" placeholder="信用点" style="width:110px"><button onclick="give(\'giveCredits\',\'creditAmt\')">给予信用点</button>' +
+    '<button id="godBtn" class="' + (godOn ? '' : 'ghost') + '" onclick="toggleGod()">' + (godOn ? '🛡 无敌模式：开' : '🛡 无敌模式：关') + '</button></div>';
+  html += '<div class="row" style="position:relative"><input id="itemSearch" placeholder="搜索物品（模糊）…" style="width:220px" oninput="searchItems()" autocomplete="off">' +
+    '<input id="itemAmt" type="number" value="1" min="1" max="99" style="width:70px"><button onclick="giveItem()">给予物品</button>' +
+    '<div id="itemResults"></div></div>';
+  html += '<div class="row"><select id="tpSel" style="min-width:220px"><option value="">— 选择传送点 —</option>' +
+    teleports.map(function(t, i){ return '<option value="' + i + '">' + esc(t.label) + ' (' + esc(t.map) + ')</option>'; }).join('') +
+    '</select><button onclick="doTeleport()">传送</button>' +
+    '<span class="dim">传送点预设在 config.json 的 adminTeleports 中配置</span></div>';
+  html += '</div>';
+  document.getElementById('detail').innerHTML = html;
+}
+
+async function switchMirror(i) {
+  if (!confirm('确定将主存档切换为镜像 #' + i + '？\n当前主存档不会自动备份进镜像列表。')) return;
+  var j = await api('/player/' + encodeURIComponent(current) + '/switchMirror', { method: 'POST', body: { index: i } });
+  showMsg(j.ok, j.msg);
+  if (j.ok) loadDetail(encodeURIComponent(current));
+}
+function exportSave() {
+  window.open('/admin/api/player/' + encodeURIComponent(current) + '/export?token=' + encodeURIComponent(TOKEN));
+}
+async function importSave(inp) {
+  var f = inp.files && inp.files[0];
+  inp.value = '';
+  if (!f) return;
+  if (!confirm('确定导入「' + f.name + '」覆盖 ' + current + ' 的主存档？\n镜像存档不受影响。')) return;
+  try {
+    var data = JSON.parse(await f.text());
+    var j = await api('/player/' + encodeURIComponent(current) + '/import', { method: 'POST', body: data });
+    showMsg(j.ok, j.msg);
+  } catch (e) { showMsg(false, '文件解析失败：' + e.message); }
+}
+async function renamePlayer() {
+  var v = document.getElementById('renameInput').value.trim();
+  if (!v) { showMsg(false, '请输入新名字'); return; }
+  if (!confirm('确定将 ' + current + ' 改名为 ' + v + '？\n在线玩家会被断开，需用新名重新登录。')) return;
+  var j = await api('/player/' + encodeURIComponent(current) + '/rename', { method: 'POST', body: { newName: v } });
+  showMsg(j.ok, j.msg);
+  if (j.ok) { current = null; document.getElementById('detail').innerHTML = '<div class="dim">← 选择左侧玩家查看详情</div>'; refreshAll(); }
+}
+async function give(kind, inputId) {
+  var amount = parseInt(document.getElementById(inputId).value, 10);
+  if (!amount || amount <= 0) { showMsg(false, '请输入有效数量'); return; }
+  var j = await api('/online/' + encodeURIComponent(current) + '/' + kind, { method: 'POST', body: { amount: amount } });
+  showMsg(j.ok, j.ok ? ('已执行' + (j.msg ? '：' + j.msg : '')) : j.msg);
+}
+function fuzzyScore(name, q) {
+  name = name.toLowerCase(); q = q.toLowerCase();
+  var at = name.indexOf(q);
+  if (at >= 0) return 100 - at;
+  var qi = 0, gaps = 0;
+  for (var i = 0; i < name.length && qi < q.length; i++) { if (name[i] === q[qi]) qi++; else gaps++; }
+  return qi === q.length ? 50 - gaps * 0.1 : -1;
+}
+function searchItems() {
+  var q = document.getElementById('itemSearch').value.trim();
+  var box = document.getElementById('itemResults');
+  pickedItem = null;
+  if (!q) { box.style.display = 'none'; return; }
+  var scored = [];
+  for (var i = 0; i < itemdb.length; i++) {
+    var it = itemdb[i], best = -1;
+    var names = Object.keys(it.names).map(function(k){ return it.names[k]; });
+    for (var n = 0; n < names.length; n++) { var s = fuzzyScore(names[n], q); if (s > best) best = s; }
+    var score = Math.max(best, String(it.id) === q ? 200 : -1);
+    if (score >= 0) scored.push({ it: it, score: score });
+  }
+  scored.sort(function(a, b){ return b.score - a.score; });
+  var top = scored.slice(0, 20);
+  if (!top.length) { box.innerHTML = '<div class="it nohit">无匹配物品（可继续输入）</div>'; box.style.display = 'block'; return; }
+  box.innerHTML = top.map(function(x){
+    var nm = x.it.names.zh_CN || x.it.names.zh_TW || x.it.names.en_US || x.it.names[Object.keys(x.it.names)[0]];
+    return '<div class="it" onmousedown="pickItem(' + x.it.id + ', \'' + String(nm).replace(/'/g, "\\'") + '\')"><span class="tip" data-item="' + x.it.id + '">' + esc(nm) + '</span><span class="id">#' + x.it.id + '</span></div>';
+  }).join('');
+  box.style.display = 'block';
+}
+function pickItem(id, name) {
+  pickedItem = id;
+  document.getElementById('itemSearch').value = name + ' #' + id;
+  document.getElementById('itemResults').style.display = 'none';
+}
+async function giveItem() {
+  if (pickedItem === null) { showMsg(false, '请先从搜索结果中选定一个物品'); return; }
+  var amount = parseInt(document.getElementById('itemAmt').value, 10) || 1;
+  if (!confirm('确定给予 ' + current + ' 物品 #' + pickedItem + ' ×' + amount + '？')) return;
+  var j = await api('/online/' + encodeURIComponent(current) + '/giveItem', { method: 'POST', body: { id: pickedItem, amount: amount } });
+  showMsg(j.ok, j.ok ? '已给予' + (j.msg ? '：' + j.msg : '') : j.msg);
+}
+async function toggleGod() {
+  var next = !godState[current];
+  var j = await api('/online/' + encodeURIComponent(current) + '/godMode', { method: 'POST', body: { on: next } });
+  if (j.ok) {
+    godState[current] = next;
+    showMsg(true, next ? '无敌模式已开启：该玩家受到的伤害均为 0（直接击杀除外）' : '无敌模式已关闭');
+    var btn = document.getElementById('godBtn');
+    if (btn) { btn.textContent = next ? '🛡 无敌模式：开' : '🛡 无敌模式：关'; btn.className = next ? '' : 'ghost'; }
+  } else showMsg(false, j.msg);
+}
+async function doTeleport() {
+  var i = document.getElementById('tpSel').value;
+  if (i === '') { showMsg(false, '请选择传送点'); return; }
+  var t = teleports[parseInt(i, 10)];
+  if (!t) return;
+  var j = await api('/online/' + encodeURIComponent(current) + '/teleport', { method: 'POST', body: { map: t.map, marker: t.marker } });
+  showMsg(j.ok, j.ok ? '已传送' + (j.msg ? '：' + j.msg : '') : j.msg);
+}
+
+// 结果列表不挡搜索框：点击其他区域或按 Esc 即收起
+document.addEventListener('mousedown', function(ev){
+  var box = document.getElementById('itemResults');
+  var inp = document.getElementById('itemSearch');
+  if (!box || box.style.display === 'none') return;
+  if (ev.target === box || box.contains(ev.target) || ev.target === inp) return;
+  box.style.display = 'none';
+});
+document.addEventListener('keydown', function(ev){
+  if (ev.key === 'Escape') {
+    var box = document.getElementById('itemResults');
+    if (box) box.style.display = 'none';
+  }
+});
+
+// ---- 装备属性悬浮窗 ----
+var TYPE_LABEL = { EQUIP: '装备', CONS: '消耗品', TRADE: '交易素材' };
+var EQT_LABEL = { HEAD: '头部', ARM: '手臂', TORSO: '躯干', FEET: '足部' };
+var ELEM_LABEL = ['火', '冰', '雷', '波']; // elemFactor 顺序: heat/cold/shock/wave
+function findItem(id) {
+  for (var i = 0; i < itemdb.length; i++) if (itemdb[i].id === id) return itemdb[i];
+  return null;
+}
+function tooltipHtml(it) {
+  var nm = it.names.zh_CN || it.names.zh_TW || it.names.en_US || it.names[Object.keys(it.names)[0]];
+  var h = '<div class="tname">' + esc(nm) + ' <span class="dim">#' + it.id + '</span></div>';
+  var meta = [];
+  if (it.type) meta.push(TYPE_LABEL[it.type] || it.type);
+  if (it.equipType) meta.push(EQT_LABEL[it.equipType] || it.equipType);
+  if (it.level) meta.push('Lv.' + it.level);
+  if (meta.length) h += '<div class="tmeta">' + meta.join(' · ') + '</div>';
+  var pr = it.params || {};
+  var rows = [['生命', pr.hp], ['攻击', pr.attack], ['防御', pr.defense], ['专注', pr.focus]];
+  var any = false;
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i][1] == null) continue;
+    any = true;
+    h += '<div class="stat"><span>' + rows[i][0] + '</span><span class="v up">+' + rows[i][1] + '</span></div>';
+  }
+  if (pr.elemFactor) {
+    for (var e = 0; e < 4; e++) {
+      var pct = Math.round((1 - pr.elemFactor[e]) * 100);
+      if (!pct) continue;
+      any = true;
+      var up = pct > 0;
+      h += '<div class="stat"><span>' + ELEM_LABEL[e] + '抗性</span><span class="v ' + (up ? 'up' : 'down') + '">' + (up ? '+' : '') + pct + '%</span></div>';
+    }
+  }
+  if (!any) h += '<div class="dim">无属性加成</div>';
+  return h;
+}
+var tipEl = null;
+document.addEventListener('mouseover', function(ev){
+  var t = ev.target && ev.target.closest ? ev.target.closest('.tip') : null;
+  tipEl = t;
+  var box = document.getElementById('tooltip');
+  if (!t) { box.style.display = 'none'; return; }
+  var id = parseInt(t.getAttribute('data-item'), 10);
+  var it = findItem(id);
+  if (!it) { box.style.display = 'none'; return; }
+  box.innerHTML = tooltipHtml(it);
+  box.style.display = 'block';
+});
+document.addEventListener('mousemove', function(ev){
+  var box = document.getElementById('tooltip');
+  if (!tipEl || box.style.display !== 'block') return;
+  var w = box.offsetWidth, hgt = box.offsetHeight;
+  var x = ev.clientX + 14, y = ev.clientY + 14;
+  if (x + w > window.innerWidth - 8) x = ev.clientX - w - 10;
+  if (y + hgt > window.innerHeight - 8) y = ev.clientY - hgt - 10;
+  box.style.left = x + 'px';
+  box.style.top = y + 'px';
+});
+
+if (!TOKEN) askToken(false); else refreshAll();
+setInterval(pollPlayers, 3000); // 每 3 秒静默同步在线状态与列表顺序
+</script>
+</body>
+</html>

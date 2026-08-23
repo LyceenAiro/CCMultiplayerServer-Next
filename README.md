@@ -2,10 +2,10 @@
 
 > English | [中文版本](README.zh-CN.md)
 
-[![Discord Server](https://img.shields.io/discord/382339402338402315.svg?label=Discord%20Server)](https://discord.gg/SJmMZKy)
+[![Discord Server](<https://img.shields.io/discord/382339402338402315.svg?label=Discord%20Server>)](https://discord.gg/SJmMZKy)
 
 Relay server for the CrossCode multiplayer mod,
-[CCMultiplayerClient](https://github.com/CCDirectLink/CCMultiplayerClient).
+[CCMultiplayerClient](https://github.com/LyceenAiro/CCMultiplayerClient).
 
 It is a small Node.js + socket.io **message relay**: clients never talk to each
 other directly, every position/animation/entity update is sent here and
@@ -13,7 +13,7 @@ forwarded to the other players on the same map. The server also elects the
 **host** client (the first to connect) and handles **host migration** when the
 host disconnects.
 
-> **Status:** compatible with the revived client. The server is game-version
+> **Status:** see the client. The server is game-version
 > agnostic — the wire protocol did not change between CrossCode 1.1.0 and
 > 1.4.2, so no code changes were needed for the 1.4.2 / CCLoader v2 update. It was
 > re-verified against `socket.io-client@4.8.x` with a live handshake test.

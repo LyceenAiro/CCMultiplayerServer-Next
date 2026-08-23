@@ -1,12 +1,19 @@
 {
-	"_comment": "monsterHpPerPlayer = extra max-HP fraction added to monsters per ADDITIONAL party member (0.7 = +70% HP per extra player; a 3-player party faces enemies at x2.4 HP). monsterAttackPerPlayer / monsterDefensePerPlayer / monsterFocusPerPlayer = same scheme for attack/defense/focus (default 0.1 = +10% per extra player). monsterResistFlatPerPlayer = FLAT elemental-resistance increase per extra player as a fraction (0.1 = +10 percentage points; default 0 = no adjustment). monsterResistPercentPerPlayer = PERCENTAGE resistance increase per extra player, applied ONLY to positive resistance (never to weaknesses; default 0 = no adjustment). Clients receive these as hpScale/attackScale/defenseScale/focusScale/resistFlat/resistPercent in the handshakeResponse and apply them with their own party roster size. saveUploadKbS = per-socket save-UPLOAD bandwidth cap in kb/s. Range [1, 10240]; default 1024. saveDownloadKbS = per-socket save-DOWNLOAD pacing in kb/s. Range [1, 10240]; default 200. port = TCP port the server listens on. Range [1, 65535]; default 15151. The process.env.PORT environment variable, when set, overrides this.",
+	"_comment": "monsterHpPerPlayer = extra max-HP fraction added to monsters per ADDITIONAL party member (0.7 = +70% HP per extra player; a 3-player party faces enemies at x2.4 HP). monsterAttackPerPlayer / monsterDefensePerPlayer / monsterFocusPerPlayer = same scheme for attack/defense/focus (default 0.1 = +10% per extra player). monsterResistFlatPerPlayer = FLAT elemental-resistance increase per extra player as a fraction (0.1 = +10 percentage points; default 0 = no adjustment). monsterResistPercentPerPlayer = PERCENTAGE resistance increase per extra player, applied ONLY to positive resistance (never to weaknesses; default 0 = no adjustment). Clients receive these as hpScale/attackScale/defenseScale/focusScale/resistFlat/resistPercent in the handshakeResponse and apply them with their own party roster size. saveUploadKbS = per-socket save-UPLOAD bandwidth cap in kb/s. Range [1, 65536]; default 16384. saveDownloadKbS = per-socket save-DOWNLOAD pacing in kb/s. Range [1, 65536]; default 16384. port = TCP port the server listens on. Range [1, 65535]; default 15151. The process.env.PORT environment variable, when set, overrides this. playerCollision = whether online players block each other: false (default) = always walk-through (no collision), true = normal collision.",
 	"monsterHpPerPlayer": 0.7,
 	"monsterAttackPerPlayer": 0.1,
 	"monsterDefensePerPlayer": 0.1,
 	"monsterFocusPerPlayer": 0.1,
 	"monsterResistFlatPerPlayer": 0,
 	"monsterResistPercentPerPlayer": 0,
-	"saveUploadKbS": 1024,
-	"saveDownloadKbS": 200,
-	"port": 15151
+	"saveUploadKbS": 16384,
+	"saveDownloadKbS": 16384,
+	"port": 15151,
+	"playerCollision": false,
+	"_adminComment": "adminToken = 管理界面访问令牌，设为非空字符串即启用 /admin 管理页（空 = 关闭，安全默认）。adminTeleports = 调试面板的传送点预设列表：[{label, map, marker?}]，marker 可省略（落在地图默认出生点）。",
+	"adminToken": "admin123",
+	"adminTeleports": [
+		{ "label": "新手港·中心广场", "map": "rookie-harbor.center", "marker": "entrance" },
+		{ "label": "罗姆斯广场", "map": "rhombus-sqr.center", "marker": "entrance" }
+	]
 }

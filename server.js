@@ -68,6 +68,15 @@ app.get('/version', function(req, res){
 	res.json({ version: config.version });
 });
 
+// 1.73.0: admin web UI + REST API at /admin (requires config.json "adminToken";
+// the router returns null when disabled). MUST mount before the 404 catch-all.
+var admin = require('./admin.js');
+var adminRouter = admin.createRouter(config);
+if (adminRouter) {
+	app.use('/admin', adminRouter);
+	console.log('[admin] web UI enabled at /admin');
+}
+
 app.get(/^(?!(\/media\/|\/data\/))/g, function(req, res){
 	res.status(404).end();
 });

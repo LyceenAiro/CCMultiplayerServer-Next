@@ -9,6 +9,7 @@ const party = require('./party');
 const world = require('./world');
 const persistence = require('./persistence');
 const config = require('./config');
+const savecodec = require('./savecodec');
 const { isValidName, isValidEntityId, isValidPos, isValidSlotKey } = require('./validate');
 
 // ctx passed to modules: lets them reach sockets / online checks without a
@@ -417,7 +418,7 @@ function handleConnection(socket) {
 
 	// ---- round 23: paced save DOWNLOAD (handshakeResponse no longer carries save) ----
 	// The client expects its save as a stream of `saveDownload` parts right after the
-	// handshake: 8192-char chunks paced at config.saveDownloadKbS (default 200 kb/s,
+	// handshake: 8192-char chunks paced at config.saveDownloadKbS (default 16384 kb/s,
 	// ≈320ms apart) so a login burst can't spike the network. A player with no save
 	// gets a single `saveDownload {slot:'autoSlot', total:0}` marker instead. The
 	// timer chain is per-socket and cleared on disconnect; one download per login
@@ -540,6 +541,8 @@ function handleConnection(socket) {
 			// Round 16: per-extra-party-member enemy HP multiplier the client applies
 			// using its own party roster size (config.json: monsterHpPerPlayer).
 			hpScale: config.monsterHpPerPlayer,
+			// Break (hit-count) threshold scaling: same per-extra-member scheme as HP.
+			breakScale: config.monsterBreakPerPlayer,
 			// Same scheme for attack/defense/focus (default +10% per extra player)
 			// and elemental resistance (flat points + positive-only percentage,
 			// both default 0 = no adjustment).
@@ -548,6 +551,10 @@ function handleConnection(socket) {
 			focusScale: config.monsterFocusPerPlayer,
 			resistFlat: config.monsterResistFlatPerPlayer,
 			resistPercent: config.monsterResistPercentPerPlayer,
+			// 1.74.x: whether player mirrors collide with the local player (config
+			// playerCollision, false = walk-through everywhere). Drives netSync's
+			// per-frame mirror collision pass.
+			playerCollision: config.playerCollision,
 			// Round 17: the accepted server version (harmless; useful for logs — the
 			// client already sent its own version in the handshake payload).
 			version: config.version,
@@ -821,7 +828,7 @@ function handleConnection(socket) {
 			if (!e || typeof e !== 'object' || typeof e.i !== 'number') continue;
 			list.push({
 				i: num(e.i),
-				k: e.k === 'S' ? 'S' : 'B',           // Stone vs Ball (both are Projectile)
+				k: e.k === 'S' ? 'S' : (e.k === 'G' ? 'G' : 'B'), // Stone / Generic-proxy / Ball
 				src: num(e.src),                       // source enemy uid (0 = unknown)
 				pn: (typeof e.pn === 'string' && e.pn.length <= 64) ? e.pn : '', // proxy name
 				x: num(e.x), y: num(e.y), z: num(e.z),
@@ -907,6 +914,16 @@ function handleConnection(socket) {
 		world.broadcastHostState(ctx, username, 'enemySoundStop', { uid: data.uid });
 	});
 
+	// ---- 1.73.0 (admin UI): item catalog feed + debug-command acks ----
+	// itemdbHello/itemdbUpload let whichever client has a loaded inventory seed the
+	// server's item-name cache (data/itemdb.json) for the admin UI's fuzzy search.
+	// adminAck resolves the pending admin.js command promise for this player.
+	require('./itemdb').bind(socket, () => username);
+	socket.on('adminAck', function (data) {
+		if (dropIfNotAuthed('adminAck')) return;
+		try { require('./admin').resolveAck(username, data); } catch (_) { /* ignore */ }
+	});
+
 	// ---- round 34 (item 3): member relays ONE of its OWN player's attack sounds ----
 	// A remote player's attack sounds (the 5 melee-swing segments, the ball THROW) are
 	// played on an ig.ENTITY.Effect whose .target is the acting player, all global:false,
@@ -944,6 +961,36 @@ function handleConnection(socket) {
 			...(radius !== undefined ? { radius } : {}),
 			...(speed !== undefined ? { speed } : {}),
 		});
+	});
+
+	// ---- 1.72.0: combat-art NAME banner relay (显示战技名) ----
+	// The vanilla banner (sc.SmallEntityBox) is spawned locally on the caster
+	// only. Relay the art's LangLabel data ({langCode: text} map) so teammates
+	// can raise the same banner over the caster's mirror — resolved in EACH
+	// receiver's own language, and gated by the RECEIVER's combat-art-name
+	// option. Auth + rate limited; payload whitelisted field-by-field.
+	socket.on('combatArtName', function (data) {
+		if (dropIfNotAuthed('combatArtName')) return;
+		if (rateLimited('combatArtName', 10)) return;
+		if (!data) return;
+		let label = null;
+		if (typeof data.label === 'string') {
+			label = data.label.slice(0, 96);
+			if (!label) return;
+		} else if (data.label && typeof data.label === 'object') {
+			const out = {};
+			let n = 0;
+			for (const k in data.label) {
+				if (n >= 12) break;
+				const v = data.label[k];
+				if (typeof k === 'string' && /^[a-z]{2}_[A-Z]{2}$/.test(k) && typeof v === 'string' && v.length <= 96) {
+					out[k] = v; n++;
+				}
+			}
+			if (!n) return;
+			label = out;
+		} else return;
+		world.broadcastToInstance(ctx, username, 'combatArtName', { player: username, label });
 	});
 
 	// ---- round 39 (item 1): a client RELEASED a sustained (looped) sound ----
@@ -1247,6 +1294,19 @@ function handleConnection(socket) {
 		if (!isFinite(off) || off <= 0 || off > 10) off = 1;
 		let def = Number(data.def);
 		if (!isFinite(def) || def <= 0 || def > 10) def = 1;
+		// 1.73.x (hint-gated reactions): carry the real attack's HINTS so reactions
+		// like mine-kamikatze's BOMB_HIT break fire on the host exactly like a local
+		// hit. Whitelist: strings only, capped count + length, de-duplicated.
+		let hints = null;
+		if (Array.isArray(data.hints)) {
+			const hs = [];
+			for (const h of data.hints) {
+				if (typeof h !== 'string' || !h || h.length > 24) continue;
+				if (hs.length >= 8) break;
+				if (hs.indexOf(h) === -1) hs.push(h);
+			}
+			if (hs.length) hints = hs;
+		}
 		world.broadcastToInstance(ctx, username, 'enemyDamage', {
 			uid: data.uid,
 			damage: Math.round(dmg),
@@ -1261,6 +1321,7 @@ function handleConnection(socket) {
 			weak: data.weak === true,
 			off: off,
 			def: def,
+			hints: hints,
 			// Elemental status: the ATTACKER-side portion of the engine's inflict
 			// formula (damageFactor × statusInflict × focus-ratio × COND_EFFECT), so
 			// the host's real enemy accumulates burn/chill/etc. from member attacks.
@@ -1431,6 +1492,118 @@ function handleConnection(socket) {
 		world.broadcastToInstance(ctx, username, 'puzzleState', { map: data.map, entries: out });
 	});
 
+	// 1.73.x: the host's EnemyCounter reached 0 (battle done). Members' counters
+	// never count puppet deaths, so the relayed battle-done cutscene would block
+	// forever on its post variable. Host relays the resolution once; receivers set
+	// both counter vars locally and zero their visible counter.
+	socket.on('enemyCounterDone', function (data) {
+		if (dropIfNotAuthed('enemyCounterDone')) return;
+		if (rateLimited('enemyCounterDone', 10)) return;
+		if (!data || typeof data.group !== 'string' || typeof data.preVar !== 'string' || typeof data.postVar !== 'string') return;
+		if (data.group.length > 64 || data.preVar.length > 96 || data.postVar.length > 96) return;
+		world.broadcastToInstance(ctx, username, 'enemyCounterDone', {
+			group: data.group,
+			preVar: data.preVar,
+			postVar: data.postVar,
+		});
+	});
+
+	// 1.73.x: the host's counter marble (red orb flying into the enemy counter).
+	// Members spawn a copy targeting their LOCAL counter so the landing animation
+	// and display zero-out match the host.
+	socket.on('counterMarble', function (data) {
+		if (dropIfNotAuthed('counterMarble')) return;
+		if (rateLimited('counterMarble', 20)) return;
+		if (!data || typeof data.group !== 'string' || data.group.length > 64) return;
+		if (typeof data.x !== 'number' || typeof data.y !== 'number' || typeof data.z !== 'number') return;
+		if (!isFinite(data.x) || !isFinite(data.y) || !isFinite(data.z)) return;
+		if (Math.abs(data.x) > 1e6 || Math.abs(data.y) > 1e6 || Math.abs(data.z) > 1e6) return;
+		world.broadcastToInstance(ctx, username, 'counterMarble', {
+			group: data.group,
+			x: Math.round(data.x),
+			y: Math.round(data.y),
+			z: Math.round(data.z),
+		});
+	});
+
+	// 1.73.x: a player pressed a dungeon elevator. Peers run the same native move
+	// on their LOCAL elevator so riders standing on the platform are carried to the
+	// destination floor with their relative position preserved.
+	socket.on('elevatorSync', function (data) {
+		if (dropIfNotAuthed('elevatorSync')) return;
+		if (rateLimited('elevatorSync', 10)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96) return;
+		const mi = Number(data.mi);
+		const dest = Number(data.dest);
+		if (!isFinite(mi) || mi <= 0 || !isFinite(dest) || dest < 0 || dest > 64) return;
+		world.broadcastToInstance(ctx, username, 'elevatorSync', {
+			map: data.map,
+			mi: Math.round(mi),
+			dest: Math.round(dest),
+		});
+	});
+
+	// 1.73.x: bomb-position stream. The bomb entity runs only on the client whose
+	// ball launched it; that client streams the live positions so peers render a
+	// flying copy. Same whitelist shape as playerBall.
+	socket.on('bombState', function (data) {
+		if (dropIfNotAuthed('bombState')) return;
+		if (rateLimited('bombState', 60)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96 || !Array.isArray(data.entries)) return;
+		const num = (v) => (typeof v === 'number' && isFinite(v)) ? Math.round(v) : 0;
+		const out = [];
+		for (const e of data.entries) {
+			if (!e || typeof e.i !== 'number' || !Number.isInteger(e.i) || e.i <= 0) continue;
+			if (out.length >= 16) break;
+			out.push({
+				i: e.i,
+				pmi: num(e.pmi),
+				x: num(e.x), y: num(e.y), z: num(e.z),
+				vx: num(e.vx), vy: num(e.vy), vz: num(e.vz),
+				t: (typeof e.t === 'number' && isFinite(e.t)) ? e.t : 0,
+				h: e.h === 1 ? 1 : 0,
+			});
+		}
+		if (!out.length) return;
+		world.broadcastToInstance(ctx, username, 'bombState', { map: data.map, entries: out });
+	});
+
+	// 1.73.x: the triggering client's bomb exploded — peers play the boom and reset
+	// their local bomb panel (blink + respawn timer).
+	socket.on('bombExplode', function (data) {
+		if (dropIfNotAuthed('bombExplode')) return;
+		if (rateLimited('bombExplode', 30)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96 || typeof data.i !== 'number') return;
+		const num = (v) => (typeof v === 'number' && isFinite(v) && Math.abs(v) <= 1e6) ? Math.round(v) : 0;
+		world.broadcastToInstance(ctx, username, 'bombExplode', {
+			map: data.map,
+			i: data.i,
+			pmi: num(data.pmi),
+			x: num(data.x),
+			y: num(data.y),
+			z: num(data.z),
+		});
+	});
+
+	// 1.73.x: a LOCAL attack hit a peer's bomb COPY — relay the interaction to the
+	// bomb's owner so the REAL bomb detonates early / heat-converts. The owner
+	// applies it natively (the copy never simulates the hit itself).
+	socket.on('bombInteract', function (data) {
+		if (dropIfNotAuthed('bombInteract')) return;
+		if (rateLimited('bombInteract', 30)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96 || typeof data.i !== 'number') return;
+		if (data.kind !== 'hit' && data.kind !== 'heat') return;
+		const dx = Number(data.dirx);
+		const dy = Number(data.diry);
+		world.broadcastToInstance(ctx, username, 'bombInteract', {
+			map: data.map,
+			i: data.i,
+			kind: data.kind,
+			dirx: (isFinite(dx) && Math.abs(dx) <= 1e4) ? Math.round(dx * 100) / 100 : 0,
+			diry: (isFinite(dy) && Math.abs(dy) <= 1e4) ? Math.round(dy * 100) / 100 : 1,
+		});
+	});
+
 	// ---- ROUND 132: player thrown-ball POSITION stream (bounce-puzzle visibility) ----
 	// throwBall relays a ball only at the MOMENT of the throw (its initial dir); once a
 	// bounce puzzle steers/resets the ball (BounceBlock.onBlockHit), teammates' one-shot
@@ -1448,13 +1621,62 @@ function handleConnection(socket) {
 			if (out.length >= 32) break;
 			out.push({
 				i: num(e.i),                          // the sender's ball uid
-				el: num(e.el),                        // sc.ELEMENT (0..4) -> ball tint
+				el: num(e.el), chg: num(e.chg),                        // sc.ELEMENT (0..4) -> ball tint
 				x: num(e.x), y: num(e.y), z: num(e.z),
 				vx: num(e.vx), vy: num(e.vy),         // 2D velocity (flight angle + dead-reckon)
 			});
 		}
 		if (!out.length) return;
 		world.broadcastToInstance(ctx, username, 'playerBall', { from: username, map: data.map, entries: out });
+	});
+
+	// 1.74.0: a member's charged ball hit a host-authoritative sliding block. The
+	// member forwards the push DIRECTION; the instance host pushes its local pillar
+	// and streams the position back (puzzleState 30Hz). Non-host members ignore it.
+	socket.on('slidingPush', function (data) {
+		if (dropIfNotAuthed('slidingPush')) return;
+		if (rateLimited('slidingPush', 20)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96) return;
+		const mi = Number(data.mi);
+		const dx = Number(data.dx);
+		const dy = Number(data.dy);
+		if (!isFinite(mi) || mi <= 0 || !isFinite(dx) || !isFinite(dy)) return;
+		if (Math.abs(dx) > 1 || Math.abs(dy) > 1) return;
+		world.broadcastToInstance(ctx, username, 'slidingPush', {
+			map: data.map,
+			mi: Math.round(mi),
+			dx: Math.max(-1, Math.min(1, Math.round(dx))),
+			dy: Math.max(-1, Math.min(1, Math.round(dy))),
+		});
+	});
+
+	// ---- ROUND 133: quest-world spawn var relay (e.g. Broken-Fist miniboss chest) ----
+	// A spawnCondition-gated quest CHEST (autumn/path-1-3's map.minibossLoot chest) only
+	// appears on the client whose world ran the trigger (kill counter / boss death are
+	// host-authoritative). storySync's mapVar relay only covers an ACTIVE side-quest
+	// sync, so co-op partners not formally syncing the quest never see the chest. This
+	// always-on relay forwards the few map/tmp vars that drive a CHEST spawnCondition.
+	// Any client -> same-instance others (like playerBall); receivers apply the var to
+	// their own storage + re-evaluate spawn conditions so THEIR hidden chest shows.
+	socket.on('spawnVar', function (data) {
+		if (dropIfNotAuthed('spawnVar')) return;
+		if (rateLimited('spawnVar', 30)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96 || !Array.isArray(data.list)) return;
+		const out = [];
+		for (const e of data.list.slice(0, 64)) {
+			if (!e || typeof e !== 'object') continue;
+			const b = e.b, k = e.k, v = e.v;
+			if (typeof b !== 'string' || typeof k !== 'string' || !k || k.length > 64 || k.indexOf('.') !== -1) continue;
+			if (b !== 'tmp' && !/^maps\.[A-Za-z0-9_.-]{1,80}$/.test(b)) continue;
+			if (k.indexOf('chest_') === 0) continue; // never relay per-player chest-opened state
+			const t = typeof v;
+			if (t !== 'number' && t !== 'boolean' && t !== 'string') continue;
+			if (t === 'number' && !isFinite(v)) continue;
+			if (t === 'string' && v.length > 128) continue;
+			out.push({ b, k, v });
+		}
+		if (!out.length) return;
+		world.broadcastToInstance(ctx, username, 'spawnVar', { from: username, map: data.map, list: out });
 	});
 
 	// ---- round 45 (Gap A, host origin): the HOST applied a member's forwarded hit to a
@@ -2799,13 +3021,20 @@ function handleConnection(socket) {
 		// Bound the save payload so a hostile/buggy client can't grow the file
 		// without limit (a real CrossCode save is well under a few MB).
 		if (typeof data.data === 'string' && data.data.length > 8 * 1024 * 1024) return;
+		// Save integrity guard: never overwrite a richer stored save with a tiny /
+		// unparseable one (see validateSaveUpload). Rejection surfaces as saveFailed.
+		const guard = validateSaveUpload(username, slot, data.data);
+		if (!guard.ok) {
+			socket.emit('saveFailed', { slot, reason: guard.reason });
+			return;
+		}
 		persistence.saveGame(username, slot, sanitizeSaveParty(data.data));
 	});
 
 	// ---- round 23: chunked, rate-limited save UPLOAD (saveChunk) ----
 	// The client splits a save into 8192-char parts and streams them paced at ~512
 	// kb/s (well under the cap). We enforce the per-socket upload cap
-	// (config.saveUploadKbS, default 1024 kb/s) with a token bucket, reassemble parts
+	// (config.saveUploadKbS, default 16384 kb/s) with a token bucket, reassemble parts
 	// in order, sanitize + persist on the LAST part, then confirm with `saveSaved`.
 	// The generation counter lets rapid map switches abort an in-flight upload (a
 	// stale gen is dropped; only the newest save wins). AREA saves ride a change-storm
@@ -2889,6 +3118,14 @@ function handleConnection(socket) {
 					return;
 				}
 			}
+			// Save integrity guard (兜底): reject a tiny / unparseable save that would
+			// overwrite a richer stored save - the stored save is left untouched and the
+			// client's onSaveFailed toast shows the reason.
+			const guard = validateSaveUpload(username, stream.slot, payload);
+			if (!guard.ok) {
+				socket.emit('saveFailed', { slot: stream.slot, reason: guard.reason });
+				return;
+			}
 			persistence.saveGame(username, stream.slot, sanitizeSaveParty(payload));
 			socket.emit('saveSaved', { slot: stream.slot, bytes: payload.length });
 		}
@@ -2900,6 +3137,49 @@ function handleConnection(socket) {
 	// runtime). Strip any party entry that isn't one of the game's real characters
 	// so the stored save is always a clean single-player save. Authoritative here so
 	// it also repairs saves already polluted by older clients.
+	// ---- save integrity guard (兜底) ----
+	// A client can (due to a race during login/restore, or a broken build) upload a
+	// nearly-empty FRESH save (hideout.entrance, level 1, no items/visited maps) over
+	// the player's real progress. Before overwriting, decrypt/inspect the incoming
+	// payload and reject it when:
+	//   - it does not decrypt/parse into a real CrossCode save object (reason 'invalid');
+	//   - the stored save is clearly rich while the incoming one is suspiciously tiny
+	//     (reason 'tooSmall') - the safety net that keeps a regression from wiping progress.
+	// Both reasons surface to the client via `saveFailed` (its onSaveFailed toast) and
+	// neither path touches the stored save. Size is measured on the raw (encrypted)
+	// payload string - fresh saves are ~6-12 KB, normal saves ~40 KB+ - so the
+	// thresholds below are intentionally loose to never block a legit early-game save.
+	function validateSaveUpload(username, slot, payload) {
+		// Below this a save looks fresh / incomplete; at/above this the stored save
+		// clearly has real progress.
+		const SAVE_TINY_CHARS = 20 * 1024;
+		const SAVE_RICH_CHARS = 30 * 1024;
+		try {
+			if (typeof payload !== 'string' || payload.length === 0) {
+				return { ok: false, reason: 'invalid' };
+			}
+			// Structural check: must decrypt/parse into an object carrying map + vars.
+			let obj = null;
+			if (savecodec.isEncryptedSlot(payload)) {
+				obj = savecodec.decryptSlotData(payload);
+			} else {
+				try { obj = JSON.parse(payload); } catch (e) { obj = null; }
+			}
+			if (!obj || typeof obj !== 'object' || !obj.map || !obj.vars) {
+				return { ok: false, reason: 'invalid' };
+			}
+			// Regression guard: only when there is an existing rich save to protect.
+			const existing = persistence.loadGame(username);
+			const cur = existing && typeof existing[slot] === 'string' ? existing[slot] : null;
+			if (cur && cur.length >= SAVE_RICH_CHARS && payload.length < SAVE_TINY_CHARS) {
+				console.warn('[protocol] rejected tiny save for ' + username + ': ' + payload.length + ' chars vs stored ' + cur.length + ' chars');
+				return { ok: false, reason: 'tooSmall' };
+			}
+			return { ok: true };
+		} catch (e) {
+			return { ok: false, reason: 'invalid' };
+		}
+	}
 	const NATIVE_PARTY = { Lea: 1, Shizuka: 1, Shizuka0: 1, Emilie: 1, Sergey: 1, Schneider: 1, Schneider2: 1, Hlin: 1, Grumpy: 1, Buggy: 1, Glasses: 1, Apollo: 1, Joern: 1, Triblader1: 1, Luke: 1 };
 	function sanitizeSaveParty(raw) {
 		try {
