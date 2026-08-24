@@ -55,8 +55,10 @@ World.prototype.isTownInstanceOfArea = function (instanceId, area) {
 	return instanceId === prefix || instanceId.indexOf(prefix + '#') === 0;
 };
 
-// Compute the instance a player should join for a given map.
-World.prototype.instanceIdFor = function (username, mapName, areaType) {
+// Compute the instance a player should join for a given map. `ctx` (optional) is
+// only used to verify a candidate host is still online; callers that don't have a
+// context fall back to trusting the instance's stored host.
+World.prototype.instanceIdFor = function (username, mapName, areaType, ctx) {
 	// Round 19: PVP-duel isolation OVERRIDES every routing rule. While isolated,
 	// the player is ALWAYS solo on the given map — even in a shared town and even
 	// if they're in a party (so a duel can't be yanked back into a group by a
@@ -67,17 +69,52 @@ World.prototype.instanceIdFor = function (username, mapName, areaType) {
 	const townArea = sharedTownArea(mapName, areaType);
 	if (townArea) {
 		// Stay in the town channel we're already in (a re-sync or a move between two
-		// sub-maps of the same area must never hop channels).
+		// sub-maps of the same area must never hop channels) — UNLESS the player is
+		// moving INTO a sub-map whose host is mid-encounter. Teammates who were
+		// already on that map when the encounter started keep co-oping (prevMap ===
+		// mapName); anyone crossing into it during the fight is re-routed below.
 		const cur = this.userInstance[username];
-		if (cur && this.isTownInstanceOfArea(cur, townArea)) return cur;
-		// Otherwise join the first channel with room; a full channel spills into a
-		// new `town:<area>#N` channel.
+		if (cur && this.isTownInstanceOfArea(cur, townArea)) {
+			const curInst = this.instances[cur];
+			const prevMap = (curInst && curInst.memberMap && curInst.memberMap[username]) || null;
+			const movingIntoEncounter = !!(curInst && curInst.host
+				&& curInst.hostInEncounter
+				&& (!curInst.hostCombatMap || curInst.hostCombatMap === mapName)
+				&& prevMap && prevMap !== mapName);
+			if (!movingIntoEncounter) return cur;
+			// Entering the encounter room mid-fight: fall through to the encounter-aware
+			// channel pick below (this channel's host is un-enterable for this map).
+		}
+		// Encounter-aware channel pick: never drop a newcomer into a channel whose
+		// HOST is mid-encounter (forceCombatMode). Among the remaining channels with
+		// room, prefer the host with the LONGEST tenure (smallest hostAt). If every
+		// existing channel is un-enterable (or full), take a fresh channel so the
+		// newcomer hosts its own room instead of joining an active battle.
+		let best = null;
+		let bestHostAt = Infinity;
+		let firstFree = null;
 		for (let channel = 0; channel < 1000; channel++) {
 			const id = channel === 0 ? ('town:' + townArea) : ('town:' + townArea + '#' + channel);
 			const inst = this.instances[id];
-			if (!inst || inst.members.length < TOWN_CAPACITY) return id;
+			if (!inst) {
+				if (firstFree === null) firstFree = id; // reuse the first gap
+				continue;
+			}
+			if (!inst.members || inst.members.length === 0) continue; // transient empty shell
+			if (inst.members.length >= TOWN_CAPACITY) continue;
+			const host = inst.host;
+			const hostOnline = !host || !ctx || ctx.isOnline(host);
+			const encounterBlocksThisRoom = inst.hostInEncounter
+				&& (!inst.hostCombatMap || inst.hostCombatMap === mapName);
+			if (!hostOnline || encounterBlocksThisRoom) continue; // not enterable
+			const at = (typeof inst.hostAt === 'number' && isFinite(inst.hostAt)) ? inst.hostAt : 0;
+			if (at < bestHostAt) {
+				bestHostAt = at;
+				best = id;
+			}
 		}
-		return 'town:' + townArea + '#999'; // unreachable safety net
+		if (best !== null) return best;
+		return firstFree !== null ? firstFree : ('town:' + townArea + '#999'); // unreachable safety net
 	}
 	const partyId = party.partyOf(username);
 	if (partyId) {
@@ -105,6 +142,31 @@ World.prototype.getInstance = function (instanceId) {
 World.prototype.isHostOf = function (username, instanceId) {
 	const inst = this.instances[instanceId];
 	return !!inst && inst.host === username;
+};
+
+// Record the CURRENT instance host's encounter lock (forceCombatMode) reported by
+// its client. `mapName` is the sub-map the host is fighting on; only newcomers to
+// that same map are blocked (an encounter elsewhere in the town area must not make
+// the whole channel un-enterable). Ignored for non-hosts so a member can never mark
+// someone else's room un-enterable.
+World.prototype.setHostEncounter = function (username, locked, mapName) {
+	const instanceId = this.userInstance[username];
+	const inst = instanceId && this.instances[instanceId];
+	if (!inst || inst.host !== username) return;
+	const next = !!locked;
+	const prev = !!inst.hostInEncounter;
+	inst.hostInEncounter = next;
+	if (next) {
+		inst.hostCombatMap = (typeof mapName === 'string' && mapName)
+			? mapName
+			: ((inst.memberMap && inst.memberMap[username]) || inst.mapName || '');
+	} else {
+		inst.hostCombatMap = '';
+	}
+	if (prev !== next) {
+		console.log('[world] instance ' + instanceId + ' host ' + username
+			+ (next ? ' entered encounter on ' + inst.hostCombatMap + ' (room join blocked)' : ' encounter ended (joinable)'));
+	}
 };
 
 // Whether the given user is the block host of whatever instance they are CURRENTLY
@@ -135,7 +197,7 @@ World.prototype.recomputeMemberInstance = function (ctx, username) {
 	if (!cur) return null;
 	const inst = this.instances[cur];
 	if (!inst) { delete this.userInstance[username]; return null; }
-	const target = this.instanceIdFor(username, inst.mapName, inst.areaType);
+	const target = this.instanceIdFor(username, inst.mapName, inst.areaType, ctx);
 	if (target === cur) return null; // instance still correct
 	const pos = (inst.memberPos && inst.memberPos[username]) || { x: 0, y: 0, z: 0 };
 	const res = this.changeMap(ctx, username, inst.mapName, inst.areaType, pos);
@@ -146,7 +208,7 @@ World.prototype.recomputeMemberInstance = function (ctx, username) {
 // their old instance and into the target one, creating it if needed. Returns
 // { instanceId, isHost, members: [{name, pos}] } for the changeMapResponse.
 World.prototype.changeMap = function (ctx, username, mapName, areaType, pos) {
-	const instanceId = this.instanceIdFor(username, mapName, areaType);
+	const instanceId = this.instanceIdFor(username, mapName, areaType, ctx);
 
 	// Already in the target instance (e.g. a re-sync): DON'T leave+rejoin — that
 	// would flap the host to someone else and spam members with leave/enter. Just
@@ -190,9 +252,16 @@ World.prototype.changeMap = function (ctx, username, mapName, areaType, pos) {
 		};
 	}
 
-	// First one in becomes the host of this instance.
+	// First one in becomes the host of this instance. Stamps the host tenure used
+	// by the encounter-aware town channel pick, and resets the encounter lock the
+	// new host has not yet reported.
 	const isHost = !inst.host || !ctx.isOnline(inst.host);
-	if (isHost) inst.host = username;
+	if (isHost) {
+		inst.host = username;
+		inst.hostAt = Date.now();
+		inst.hostInEncounter = false;
+		inst.hostCombatMap = '';
+	}
 
 	// Round 35 (void-creature): a party member who crosses a map exit FIRST becomes the
 	// lone host of the fresh `party:<pid>:<map>` instance. Round-35's first fix told that
@@ -277,6 +346,9 @@ World.prototype.leaveCurrentInstance = function (ctx, username) {
 		const next = inst.members.find((m) => ctx.isOnline(m));
 		if (next) {
 			inst.host = next;
+			inst.hostAt = Date.now();
+			inst.hostInEncounter = false; // the fresh host reports its own state
+			inst.hostCombatMap = '';
 			const sock = ctx.getSocket(next);
 			if (sock) {
 				// Main-city refactor: a town instance spans a whole area, so the new host

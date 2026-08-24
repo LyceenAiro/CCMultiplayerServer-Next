@@ -1,11 +1,11 @@
-# CCMultiplayerServer(中文)
+# CCMultiplayerServer-Next(中文)
 
 > [English README](README.md) | 中文版本
 
 [![Discord Server](<https://img.shields.io/discord/382339402338402315.svg?label=Discord%20Server>)](https://discord.gg/SJmMZKy)
 
 CrossCode 多人模组
-[CCMultiplayerClient](https://github.com/LyceenAiro/CCMultiplayerClient)
+[CCMultiplayerClient-Next](https://github.com/LyceenAiro/CCMultiplayerClient)
 的**中继服务器**。
 
 它是一个小型的 Node.js + socket.io **消息中继**:客户端之间从不直接通信,

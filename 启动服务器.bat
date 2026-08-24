@@ -57,7 +57,7 @@ if defined OLD_PIDS (
 )
 
 echo.
-echo Starting CrossCode Multiplayer server v1.74.0 on port %USE_PORT%...
+echo Starting CrossCode Multiplayer server v1.75.0 on port %USE_PORT%...
 echo Close this window or press Ctrl+C to stop the server.
 set "PORT=%USE_PORT%"
 node server.js

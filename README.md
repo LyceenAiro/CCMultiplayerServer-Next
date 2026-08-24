@@ -1,11 +1,11 @@
-# CCMultiplayerServer
+# CCMultiplayerServer-Next
 
 > English | [中文版本](README.zh-CN.md)
 
-[![Discord Server](<https://img.shields.io/discord/382339402338402315.svg?label=Discord%20Server>)](https://discord.gg/SJmMZKy)
+[![Discord Server](https://img.shields.io/discord/382339402338402315.svg?label=Discord%20Server)](https://discord.gg/SJmMZKy)
 
 Relay server for the CrossCode multiplayer mod,
-[CCMultiplayerClient](https://github.com/LyceenAiro/CCMultiplayerClient).
+[CCMultiplayerClient-Next](https://github.com/LyceenAiro/CCMultiplayerClient).
 
 It is a small Node.js + socket.io **message relay**: clients never talk to each
 other directly, every position/animation/entity update is sent here and
@@ -15,7 +15,7 @@ host disconnects.
 
 > **Status:** see the client. The server is game-version
 > agnostic — the wire protocol did not change between CrossCode 1.1.0 and
-> 1.4.2, so no code changes were needed for the 1.4.2 / CCLoader v2 update. It was
+> 1.4.2, so **no code changes were needed** for the 1.4.2 / CCLoader v2 update. It was
 > re-verified against `socket.io-client@4.8.x` with a live handshake test.
 
 ## Requirements
@@ -55,12 +55,12 @@ Then point the client's `config/config.json` at it, e.g.:
 - `user.js` tracks connected users, their current map and position, and the
   elected host. It relays the mod's events (`changeMap`, `updatePosition`,
   `updateAnimation`, `registerEntity`, `updateEntity*`, `throwBall`,
-  `killEntity`, …) to the other users on the same map.
+  `killEntity`, etc.) to the other users on the same map.
 - `userUtilities.js` / `cmd.js` provide helpers and an optional interactive
   console.
 - `persistence.js` stores accounts, friendships and per-user cloud saves in
   `data/`. Since **1.71.0** it also keeps the **last five distinct save
-  mirrors** per player; the client's 镜像回溯 (rollback) login flow can stream
+  mirrors** per player; the client's mirror-rollback login flow can stream
   any one of them back via `saveMirrorRestore`.
 - Since **1.71.2** the `puzzleState` relay also whitelists push/pull box grip
   ownership (`own` / `ot`). From **1.71.3** the client treats PushPullDest /
@@ -80,7 +80,7 @@ Then point the client's `config/config.json` at it, e.g.:
   relay).
 
 For the full event list see the client README's
-[Network protocol](https://github.com/CCDirectLink/CCMultiplayerClient#network-protocol)
+[Network protocol](https://github.com/LyceenAiro/CCMultiplayerClient-Next#network-protocol)
 section.
 
 ## Built With

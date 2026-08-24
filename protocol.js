@@ -543,6 +543,11 @@ function handleConnection(socket) {
 			hpScale: config.monsterHpPerPlayer,
 			// Break (hit-count) threshold scaling: same per-extra-member scheme as HP.
 			breakScale: config.monsterBreakPerPlayer,
+			// Elemental-status THRESHOLD scaling (config.json
+			// monsterStatusThresholdPerPlayer, default 0.6 = +60% bar-fill required
+			// per extra member). The host divides enemy statusInflict susceptibility
+			// by 1 + statusScale * (partySize - 1).
+			statusScale: config.monsterStatusThresholdPerPlayer,
 			// Same scheme for attack/defense/focus (default +10% per extra player)
 			// and elemental resistance (flat points + positive-only percentage,
 			// both default 0 = no adjustment).
@@ -555,6 +560,13 @@ function handleConnection(socket) {
 			// playerCollision, false = walk-through everywhere). Drives netSync's
 			// per-frame mirror collision pass.
 			playerCollision: config.playerCollision,
+			// Soft-death revive tuning (config.json): HP fraction restored on a
+			// normal (0.5 = 50%) vs boss (0.25 = 25%) revive, and the countdown in
+			// seconds for normal vs boss combat (both default 30).
+			softDeathReviveHpNormal: config.softDeathReviveHpNormal,
+			softDeathReviveHpBoss: config.softDeathReviveHpBoss,
+			softDeathReviveTimeNormal: config.softDeathReviveTimeNormal,
+			softDeathReviveTimeBoss: config.softDeathReviveTimeBoss,
 			// Round 17: the accepted server version (harmless; useful for logs — the
 			// client already sent its own version in the handshake payload).
 			version: config.version,
@@ -770,6 +782,18 @@ function handleConnection(socket) {
 			st: (Array.isArray(s.st) && s.st.length === 5) ? s.st.map(function (v) { return (typeof v === 'number' && isFinite(v)) ? Math.max(0, Math.min(999, Math.round(v))) : 0; }) : undefined,
 		});
 	});
+	// ---- 1.75.x: encounter-aware town matchmaking ----
+	// The instance HOST reports its forceCombatMode (locked encounter battle) so the
+	// world router can avoid matching newcomers into a channel mid-encounter.
+	// Change-gated on the client; 10/s cap bounds a hostile flood. Non-host reports
+	// are ignored by world.setHostEncounter (a member can never block a room).
+	socket.on('combatState', function (data) {
+		if (dropIfNotAuthed('combatState')) return;
+		if (rateLimited('combatState', 10)) return;
+		const locked = !!(data && data.locked);
+		const map = (data && typeof data.map === 'string' && data.map.length <= 128) ? data.map : '';
+		world.setHostEncounter(username, locked, map);
+	});
 	// ---- round 82: door-open visual sync ----
 	// When a player walks into a mapped door their client broadcasts the door so the
 	// other members on the same map can open their local copy and watch the remote
@@ -833,6 +857,11 @@ function handleConnection(socket) {
 				pn: (typeof e.pn === 'string' && e.pn.length <= 64) ? e.pn : '', // proxy name
 				x: num(e.x), y: num(e.y), z: num(e.z),
 				vx: num(e.vx), vy: num(e.vy),          // 2D velocity (flight angle only)
+				// ROUND 138 (icicle shatter sync): the host sets d=1 once a generic proxy is
+				// destroyed (Digmo icicle shattered -> killEffect plays). The old whitelist
+				// stripped it, so the member's immediate-shatter path never fired and the copy
+				// vanished silently at the stale-reap. Pass it through (1 or 0).
+				d: e.d === 1 ? 1 : 0,
 			});
 		}
 		world.broadcastHostState(ctx, username, 'projectileState', { map: block.map, e: list });
@@ -1137,6 +1166,23 @@ function handleConnection(socket) {
 		});
 	});
 
+	// ---- 1.75.x: player skill-FX STOP relay ----
+	// A LOOPING player-skill effect on the caster just ended (every engine stop
+	// path funnels through Effect.stop). Same whitelist shape as skillFx minus
+	// position/params; receivers stop their replayed copy — without it the heat
+	// guard art's flameGuard (blinkCount:-1) stays blinking on mirrors forever.
+	socket.on('skillFxStop', function (data) {
+		if (dropIfNotAuthed('skillFxStop')) return;
+		if (rateLimited('skillFxStop', 50)) return;
+		if (!data || typeof data.sheet !== 'string' || typeof data.key !== 'string') return;
+		if (data.sheet.length > 64 || data.key.length > 64) return;
+		world.broadcastToInstance(ctx, username, 'skillFxStop', {
+			player: username,
+			sheet: data.sheet,
+			key: data.key,
+		});
+	});
+
 	// ---- enemy action FX relay (charge-up telegraphs etc.) ----
 	// A whitelisted effect sheet spawned on a HOST-side real enemy (e.g. the
 	// snowman's coldMegaCharge windup). The enemy's action only runs on the host,
@@ -1268,7 +1314,10 @@ function handleConnection(socket) {
 		if (rateLimited('enemyDamage', 50)) return;
 		if (!data || typeof data.uid !== 'number') return;
 		const dmg = Number(data.damage);
-		if (!isFinite(dmg) || dmg <= 0 || dmg > 100000) return;
+		// ROUND 138: damage === 0 is a legit connected hit (shielded chip rounding to 0)
+		// that still advances the host's hit-count break trackers (native parity) — only
+		// negative/NaN are rejected now. The host clamps the HP write to a 1-point chip.
+		if (!isFinite(dmg) || dmg < 0 || dmg > 100000) return;
 		// ROUND 32 (item 3c): pass through the REAL attack's interrupt/knockback
 		// strength. Old clients omit these -> type defaults to 2 (MEDIUM, the old
 		// fabricated value) so behaviour is unchanged for a mixed client/server pair.
@@ -1307,6 +1356,13 @@ function handleConnection(socket) {
 			}
 			if (hs.length) hints = hs;
 		}
+		// 1.74.x (ball impact feel): the attacker's LOCAL hit coordinates — its ball
+		// died where IT saw the enemy (its view lags the host's real enemy). Every
+		// receiver uses THIS point as the ball-puppet kill point, so the puppet
+		// bursts exactly where the attacker's ball landed instead of around the
+		// receiver's own (differently-lagged) enemy copy. Optional, position-range.
+		let hx = Number(data.hx), hy = Number(data.hy);
+		if (!isFinite(hx) || !isFinite(hy) || Math.abs(hx) > 100000 || Math.abs(hy) > 100000) { hx = undefined; hy = undefined; }
 		world.broadcastToInstance(ctx, username, 'enemyDamage', {
 			uid: data.uid,
 			damage: Math.round(dmg),
@@ -1326,6 +1382,7 @@ function handleConnection(socket) {
 			// formula (damageFactor × statusInflict × focus-ratio × COND_EFFECT), so
 			// the host's real enemy accumulates burn/chill/etc. from member attacks.
 			stb: (typeof data.stb === 'number' && isFinite(data.stb) && data.stb > 0 && data.stb <= 100) ? data.stb : undefined,
+			...(hx !== undefined ? { hx: Math.round(hx), hy: Math.round(hy) } : {}),
 		});
 	});
 
@@ -1622,6 +1679,9 @@ function handleConnection(socket) {
 			out.push({
 				i: num(e.i),                          // the sender's ball uid
 				el: num(e.el), chg: num(e.chg),                        // sc.ELEMENT (0..4) -> ball tint
+				// 1.75.x: the matched proxy NAME (skill projectiles keep their real
+				// visuals on receivers instead of the default element ball).
+				pn: (typeof e.pn === 'string' && e.pn.length > 0 && e.pn.length <= 40) ? e.pn : undefined,
 				x: num(e.x), y: num(e.y), z: num(e.z),
 				vx: num(e.vx), vy: num(e.vy),         // 2D velocity (flight angle + dead-reckon)
 			});
@@ -1630,9 +1690,10 @@ function handleConnection(socket) {
 		world.broadcastToInstance(ctx, username, 'playerBall', { from: username, map: data.map, entries: out });
 	});
 
-	// 1.74.0: a member's charged ball hit a host-authoritative sliding block. The
-	// member forwards the push DIRECTION; the instance host pushes its local pillar
-	// and streams the position back (puzzleState 30Hz). Non-host members ignore it.
+	// 1.74.0: a member's charged ball / bomb hit a host-authoritative sliding block.
+	// The member forwards the push INGREDIENTS (direction hint + hit point + ball
+	// velocity); the instance host recomputes the real direction against ITS block
+	// and performs (or refuses) the push. Non-host members ignore it.
 	socket.on('slidingPush', function (data) {
 		if (dropIfNotAuthed('slidingPush')) return;
 		if (rateLimited('slidingPush', 20)) return;
@@ -1642,11 +1703,16 @@ function handleConnection(socket) {
 		const dy = Number(data.dy);
 		if (!isFinite(mi) || mi <= 0 || !isFinite(dx) || !isFinite(dy)) return;
 		if (Math.abs(dx) > 1 || Math.abs(dy) > 1) return;
+		const opt = (v) => (typeof v === 'number' && isFinite(v) && Math.abs(v) <= 100000) ? v : undefined;
 		world.broadcastToInstance(ctx, username, 'slidingPush', {
 			map: data.map,
 			mi: Math.round(mi),
 			dx: Math.max(-1, Math.min(1, Math.round(dx))),
 			dy: Math.max(-1, Math.min(1, Math.round(dy))),
+			hx: opt(data.hx),
+			hy: opt(data.hy),
+			vx: opt(data.vx),
+			vy: opt(data.vy),
 		});
 	});
 
@@ -1710,9 +1776,14 @@ function handleConnection(socket) {
 		if (!isFinite(off) || off <= 0 || off > 10) off = 1;
 		let def = Number(data.def);
 		if (!isFinite(def) || def <= 0 || def > 10) def = 1;
+		// 1.74.x: relay the attacker's local hit coordinates (see enemyDamage) so
+		// spectators kill the ball puppet where the hit actually landed.
+		let hx = Number(data.hx), hy = Number(data.hy);
+		if (!isFinite(hx) || !isFinite(hy) || Math.abs(hx) > 100000 || Math.abs(hy) > 100000) { hx = undefined; hy = undefined; }
 		world.broadcastHostState(ctx, username, 'enemyHurt', {
 			uid: data.uid, type: Math.round(type),
 			attackElement: Math.round(attackElement), critical: data.critical === true,
+			...(hx !== undefined ? { hx: Math.round(hx), hy: Math.round(hy) } : {}),
 			...(attacker !== undefined ? { attacker } : {}),
 			...(hurtDmg !== undefined ? { damage: Math.round(hurtDmg), shield: Math.round(shield), weak: data.weak === true, off: off, def: def } : {}),
 		});

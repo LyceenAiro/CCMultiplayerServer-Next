@@ -14,6 +14,12 @@
 //                       extra hit-count break threshold fraction per ADDITIONAL
 //                       party member. 0.7 = +70% per extra player. Sent as
 //                       breakScale in the handshakeResponse.
+//   monsterStatusThresholdPerPlayer
+//                       extra elemental-status THRESHOLD fraction per ADDITIONAL
+//                       party member. 0.6 = +60% bar-fill required per extra
+//                       player (the enemy's statusInflict susceptibility is
+//                       divided by 1 + 0.6 * extra). Sent as statusScale in the
+//                       handshakeResponse.
 //   monsterAttackPerPlayer / monsterDefensePerPlayer / monsterFocusPerPlayer
 //                       same scheme for the attack/defense/focus stats (default
 //                       0.1 = +10% per extra player). Sent as attackScale /
@@ -42,6 +48,18 @@
 //                       = players NEVER collide (walk-through everywhere, not just
 //                       towns/cutscenes). true = normal player-vs-player collision.
 //                       Sent to clients as `playerCollision` in the handshakeResponse.
+//   softDeathReviveHpNormal / softDeathReviveHpBoss
+//                       HP fraction restored on a soft-death revive. Normal field /
+//                       non-boss combat revives use the former (default 0.5 = 50%);
+//                       revives while a boss fight is active use the latter
+//                       (default 0.25 = 25%). Range [0.01, 1].
+//   softDeathReviveTimeNormal / softDeathReviveTimeBoss
+//                       soft-death revive countdown in SECONDS. Normal combat uses
+//                       the former, boss combat the latter; both default to 30.
+//                       Range [1, 3600]. Out-of-combat deaths keep the built-in
+//                       ~3s quick revive and are not configurable. All four values
+//                       are sent to clients under the same names in the
+//                       handshakeResponse.
 const fs = require('fs');
 const path = require('path');
 
@@ -50,6 +68,7 @@ const CONFIG_FILE = path.join(__dirname, 'config.json');
 const DEFAULTS = {
 	monsterHpPerPlayer: 0.7,
 	monsterBreakPerPlayer: 0.7,
+	monsterStatusThresholdPerPlayer: 0.6,
 	monsterAttackPerPlayer: 0.1,
 	monsterDefensePerPlayer: 0.1,
 	monsterFocusPerPlayer: 0.1,
@@ -69,12 +88,16 @@ const DEFAULTS = {
 	// false (default) = players NEVER block each other (walk-through everywhere,
 	// not just towns/cutscenes). true = normal player-vs-player collision.
 	playerCollision: false,
+	softDeathReviveHpNormal: 0.5,
+	softDeathReviveHpBoss: 0.25,
+	softDeathReviveTimeNormal: 30,
+	softDeathReviveTimeBoss: 30,
 };
 
 // Round 17: mod version. The server rejects any client whose mod version differs
 // (handshake gate in protocol.js). Bump this TOGETHER with the client mod version
 // (client src/multiplayer.ts MP_VERSION + package.json "version") on every release.
-const MOD_VERSION = '1.74.0';
+const MOD_VERSION = '1.75.0';
 
 function loadConfig() {
 	const cfg = Object.assign({}, DEFAULTS);
@@ -96,6 +119,7 @@ function loadConfig() {
 	};
 	cfg.monsterHpPerPlayer = clampFrac('monsterHpPerPlayer', DEFAULTS.monsterHpPerPlayer, 10);
 	cfg.monsterBreakPerPlayer = clampFrac('monsterBreakPerPlayer', DEFAULTS.monsterBreakPerPlayer, 10);
+	cfg.monsterStatusThresholdPerPlayer = clampFrac('monsterStatusThresholdPerPlayer', DEFAULTS.monsterStatusThresholdPerPlayer, 10);
 	cfg.monsterAttackPerPlayer = clampFrac('monsterAttackPerPlayer', DEFAULTS.monsterAttackPerPlayer, 10);
 	cfg.monsterDefensePerPlayer = clampFrac('monsterDefensePerPlayer', DEFAULTS.monsterDefensePerPlayer, 10);
 	cfg.monsterFocusPerPlayer = clampFrac('monsterFocusPerPlayer', DEFAULTS.monsterFocusPerPlayer, 10);
@@ -103,6 +127,20 @@ function loadConfig() {
 	// there); resPercent is a multiplier fraction (10 = +1000%).
 	cfg.monsterResistFlatPerPlayer = clampFrac('monsterResistFlatPerPlayer', DEFAULTS.monsterResistFlatPerPlayer, 1);
 	cfg.monsterResistPercentPerPlayer = clampFrac('monsterResistPercentPerPlayer', DEFAULTS.monsterResistPercentPerPlayer, 10);
+	// Soft-death revive HP fractions: [0.01, 1] so a revive can never produce 0 HP.
+	const clampReviveHp = (key, def) => {
+		const v = Number(cfg[key]);
+		return (isFinite(v) && v >= 0.01 && v <= 1) ? v : def;
+	};
+	cfg.softDeathReviveHpNormal = clampReviveHp('softDeathReviveHpNormal', DEFAULTS.softDeathReviveHpNormal);
+	cfg.softDeathReviveHpBoss = clampReviveHp('softDeathReviveHpBoss', DEFAULTS.softDeathReviveHpBoss);
+	// Soft-death revive countdowns: seconds, [1, 3600].
+	const clampReviveSec = (key, def) => {
+		const v = Number(cfg[key]);
+		return (isFinite(v) && v >= 1 && v <= 3600) ? v : def;
+	};
+	cfg.softDeathReviveTimeNormal = clampReviveSec('softDeathReviveTimeNormal', DEFAULTS.softDeathReviveTimeNormal);
+	cfg.softDeathReviveTimeBoss = clampReviveSec('softDeathReviveTimeBoss', DEFAULTS.softDeathReviveTimeBoss);
 	// Clamp the save bandwidth caps to a sane finite range [1, 65536] kb/s so a
 	// config typo can't turn the save stream into a firehose or a crawl.
 	const clampKbS = (key, def) => {
@@ -138,10 +176,15 @@ console.log('[config] multiplayer mod v' + config.version +
 	' | monsterHpPerPlayer = ' + config.monsterHpPerPlayer +
 	' (monsters gain +' + (config.monsterHpPerPlayer * 100) + '% max HP per extra party member)' +
 	' | monsterBreakPerPlayer = +' + (config.monsterBreakPerPlayer * 100) + '% per extra member' +
+	' | monsterStatusThresholdPerPlayer = +' + (config.monsterStatusThresholdPerPlayer * 100) + '% per extra member' +
 	' | atk/def/foc per player = +' + (config.monsterAttackPerPlayer * 100) + '%/+' +
 		(config.monsterDefensePerPlayer * 100) + '%/+' + (config.monsterFocusPerPlayer * 100) + '%' +
 	' | resist flat/percent per player = +' + (config.monsterResistFlatPerPlayer * 100) + 'pt/+' +
 		(config.monsterResistPercentPerPlayer * 100) + '%' +
+	' | softDeath revive HP normal/boss = ' + Math.round(config.softDeathReviveHpNormal * 100) + '%/' +
+		Math.round(config.softDeathReviveHpBoss * 100) + '%' +
+	' | softDeath revive time normal/boss = ' + config.softDeathReviveTimeNormal + 's/' +
+		config.softDeathReviveTimeBoss + 's' +
 	' | saveUploadKbS = ' + config.saveUploadKbS +
 	' | saveDownloadKbS = ' + config.saveDownloadKbS +
 	' | playerCollision = ' + config.playerCollision +

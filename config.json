@@ -1,6 +1,7 @@
 {
-	"_comment": "monsterHpPerPlayer = extra max-HP fraction added to monsters per ADDITIONAL party member (0.7 = +70% HP per extra player; a 3-player party faces enemies at x2.4 HP). monsterAttackPerPlayer / monsterDefensePerPlayer / monsterFocusPerPlayer = same scheme for attack/defense/focus (default 0.1 = +10% per extra player). monsterResistFlatPerPlayer = FLAT elemental-resistance increase per extra player as a fraction (0.1 = +10 percentage points; default 0 = no adjustment). monsterResistPercentPerPlayer = PERCENTAGE resistance increase per extra player, applied ONLY to positive resistance (never to weaknesses; default 0 = no adjustment). Clients receive these as hpScale/attackScale/defenseScale/focusScale/resistFlat/resistPercent in the handshakeResponse and apply them with their own party roster size. saveUploadKbS = per-socket save-UPLOAD bandwidth cap in kb/s. Range [1, 65536]; default 16384. saveDownloadKbS = per-socket save-DOWNLOAD pacing in kb/s. Range [1, 65536]; default 16384. port = TCP port the server listens on. Range [1, 65535]; default 15151. The process.env.PORT environment variable, when set, overrides this. playerCollision = whether online players block each other: false (default) = always walk-through (no collision), true = normal collision.",
+	"_comment": "monsterHpPerPlayer = extra max-HP fraction added to monsters per ADDITIONAL party member (0.7 = +70% HP per extra player; a 3-player party faces enemies at x2.4 HP). monsterStatusThresholdPerPlayer = extra elemental-status threshold fraction per additional party member (0.6 = +60% bar-fill required per extra player; the enemy's statusInflict susceptibility is divided by 1 + 0.6 * extra, so each elemental status takes proportionally more hits to trigger). monsterAttackPerPlayer / monsterDefensePerPlayer / monsterFocusPerPlayer = same scheme for attack/defense/focus (default 0.1 = +10% per extra player). monsterResistFlatPerPlayer = FLAT elemental-resistance increase per extra player as a fraction (0.1 = +10 percentage points; default 0 = no adjustment). monsterResistPercentPerPlayer = PERCENTAGE resistance increase per extra player, applied ONLY to positive resistance (never to weaknesses; default 0 = no adjustment). Clients receive these as hpScale/statusScale/attackScale/defenseScale/focusScale/resistFlat/resistPercent in the handshakeResponse and apply them with their own party roster size. The softDeathRevive* values are sent under the same names in the handshakeResponse. saveUploadKbS = per-socket save-UPLOAD bandwidth cap in kb/s. Range [1, 65536]; default 16384. saveDownloadKbS = per-socket save-DOWNLOAD pacing in kb/s. Range [1, 65536]; default 16384. port = TCP port the server listens on. Range [1, 65535]; default 15151. The process.env.PORT environment variable, when set, overrides this. playerCollision = whether online players block each other: false (default) = always walk-through (no collision), true = normal collision. softDeathReviveHpNormal / softDeathReviveHpBoss = HP fraction restored on soft-death revive for normal combat (default 0.5 = 50%) and boss combat (default 0.25 = 25%), range [0.01, 1]. softDeathReviveTimeNormal / softDeathReviveTimeBoss = soft-death revive countdown seconds for normal combat and boss combat (both default 30), range [1, 3600]; out-of-combat deaths keep the built-in ~3s quick revive.",
 	"monsterHpPerPlayer": 0.7,
+	"monsterStatusThresholdPerPlayer": 0.6,
 	"monsterAttackPerPlayer": 0.1,
 	"monsterDefensePerPlayer": 0.1,
 	"monsterFocusPerPlayer": 0.1,
@@ -10,6 +11,10 @@
 	"saveDownloadKbS": 16384,
 	"port": 15151,
 	"playerCollision": false,
+	"softDeathReviveHpNormal": 0.5,
+	"softDeathReviveHpBoss": 0.25,
+	"softDeathReviveTimeNormal": 30,
+	"softDeathReviveTimeBoss": 30,
 	"_adminComment": "adminToken = 管理界面访问令牌，设为非空字符串即启用 /admin 管理页（空 = 关闭，安全默认）。adminTeleports = 调试面板的传送点预设列表：[{label, map, marker?}]，marker 可省略（落在地图默认出生点）。",
 	"adminToken": "admin123",
 	"adminTeleports": [
