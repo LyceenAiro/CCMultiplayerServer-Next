@@ -6,18 +6,26 @@
 //
 // Config keys (config.json):
 //   monsterHpPerPlayer  extra max-HP fraction added to enemies per ADDITIONAL
-//                       party member. 0.7 = +70% HP per extra player, so a
-//                       3-player party faces enemies at x2.4 HP. Clients receive
+//                       player IN THE ROOM (1.75.x: room player count, not the
+//                       party roster). 0.7 = +70% HP per extra player, so a
+//                       3-player room faces enemies at x2.4 HP. Clients receive
 //                       this as `hpScale` in the handshakeResponse and apply it
-//                       using their own party roster size.
+//                       using their room player count.
+//   monsterBossHpPerPlayer
+//                       extra max-HP fraction for BOSS enemies ONLY (enemyType
+//                       .boss on the client), same per-ADDITIONAL-player scheme.
+//                       Default 0.9 = +90% max HP per extra player (a 3-player
+//                       room faces bosses at x2.8 HP). Sent as hpScaleBoss in
+//                       the handshakeResponse; regular enemies keep using
+//                       monsterHpPerPlayer.
 //   monsterBreakPerPlayer
 //                       extra hit-count break threshold fraction per ADDITIONAL
-//                       party member. 0.7 = +70% per extra player. Sent as
+//                       player in the room. 0.7 = +70% per extra player. Sent as
 //                       breakScale in the handshakeResponse.
 //   monsterStatusThresholdPerPlayer
 //                       extra elemental-status THRESHOLD fraction per ADDITIONAL
-//                       party member. 0.6 = +60% bar-fill required per extra
-//                       player (the enemy's statusInflict susceptibility is
+//                       player in the room. 0.6 = +60% bar-fill required per
+//                       extra player (the enemy's statusInflict susceptibility is
 //                       divided by 1 + 0.6 * extra). Sent as statusScale in the
 //                       handshakeResponse.
 //   monsterAttackPerPlayer / monsterDefensePerPlayer / monsterFocusPerPlayer
@@ -67,6 +75,9 @@ const CONFIG_FILE = path.join(__dirname, 'config.json');
 
 const DEFAULTS = {
 	monsterHpPerPlayer: 0.7,
+	// 1.76.x: separate per-extra-member HP increment for bosses (enemyType.boss);
+	// default +90% per extra party member.
+	monsterBossHpPerPlayer: 0.9,
 	monsterBreakPerPlayer: 0.7,
 	monsterStatusThresholdPerPlayer: 0.6,
 	monsterAttackPerPlayer: 0.1,
@@ -118,6 +129,7 @@ function loadConfig() {
 		return (isFinite(v) && v >= 0 && v <= max) ? v : def;
 	};
 	cfg.monsterHpPerPlayer = clampFrac('monsterHpPerPlayer', DEFAULTS.monsterHpPerPlayer, 10);
+	cfg.monsterBossHpPerPlayer = clampFrac('monsterBossHpPerPlayer', DEFAULTS.monsterBossHpPerPlayer, 10);
 	cfg.monsterBreakPerPlayer = clampFrac('monsterBreakPerPlayer', DEFAULTS.monsterBreakPerPlayer, 10);
 	cfg.monsterStatusThresholdPerPlayer = clampFrac('monsterStatusThresholdPerPlayer', DEFAULTS.monsterStatusThresholdPerPlayer, 10);
 	cfg.monsterAttackPerPlayer = clampFrac('monsterAttackPerPlayer', DEFAULTS.monsterAttackPerPlayer, 10);
@@ -174,9 +186,10 @@ config.version = MOD_VERSION;
 
 console.log('[config] multiplayer mod v' + config.version +
 	' | monsterHpPerPlayer = ' + config.monsterHpPerPlayer +
-	' (monsters gain +' + (config.monsterHpPerPlayer * 100) + '% max HP per extra party member)' +
-	' | monsterBreakPerPlayer = +' + (config.monsterBreakPerPlayer * 100) + '% per extra member' +
-	' | monsterStatusThresholdPerPlayer = +' + (config.monsterStatusThresholdPerPlayer * 100) + '% per extra member' +
+	' (monsters gain +' + (config.monsterHpPerPlayer * 100) + '% max HP per extra player in the room)' +
+	' | monsterBossHpPerPlayer = +' + (config.monsterBossHpPerPlayer * 100) + '% per extra player (bosses)' +
+	' | monsterBreakPerPlayer = +' + (config.monsterBreakPerPlayer * 100) + '% per extra player' +
+	' | monsterStatusThresholdPerPlayer = +' + (config.monsterStatusThresholdPerPlayer * 100) + '% per extra player' +
 	' | atk/def/foc per player = +' + (config.monsterAttackPerPlayer * 100) + '%/+' +
 		(config.monsterDefensePerPlayer * 100) + '%/+' + (config.monsterFocusPerPlayer * 100) + '%' +
 	' | resist flat/percent per player = +' + (config.monsterResistFlatPerPlayer * 100) + 'pt/+' +

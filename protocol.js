@@ -541,6 +541,10 @@ function handleConnection(socket) {
 			// Round 16: per-extra-party-member enemy HP multiplier the client applies
 			// using its own party roster size (config.json: monsterHpPerPlayer).
 			hpScale: config.monsterHpPerPlayer,
+			// 1.76.x: bosses (enemyType.boss) scale by their OWN per-extra-member HP
+			// increment (config.json monsterBossHpPerPlayer, default 0.9 = +90% per
+			// extra player). Regular enemies keep using hpScale above.
+			hpScaleBoss: config.monsterBossHpPerPlayer,
 			// Break (hit-count) threshold scaling: same per-extra-member scheme as HP.
 			breakScale: config.monsterBreakPerPlayer,
 			// Elemental-status THRESHOLD scaling (config.json
@@ -780,6 +784,18 @@ function handleConnection(socket) {
 			// charge as integer percent, mask bit i = status i active. Teammates'
 			// mirrors show the owner's real status bar + debuff FX from this.
 			st: (Array.isArray(s.st) && s.st.length === 5) ? s.st.map(function (v) { return (typeof v === 'number' && isFinite(v)) ? Math.max(0, Math.min(999, Math.round(v))) : 0; }) : undefined,
+			// 1.75.x: teammate ranged-charge aim line. al=1 only while the owner's
+			// crosshair has focused into a single straight line; ax/ay is its
+			// normalized direction (clamped to [-1,1], omitted when al is off or
+			// the value is invalid). cax/cay/caz is the owner's actual crosshair
+			// anchor world position, used by teammates to draw the mouse anchor
+			// and derive the reflected (wall-bounce) line from it.
+			al: s.al ? 1 : 0,
+			ax: (s.al && typeof s.ax === 'number' && isFinite(s.ax)) ? Math.max(-1, Math.min(1, s.ax)) : undefined,
+			ay: (s.al && typeof s.ay === 'number' && isFinite(s.ay)) ? Math.max(-1, Math.min(1, s.ay)) : undefined,
+			cax: (s.al && typeof s.cax === 'number' && isFinite(s.cax)) ? Math.max(-1e6, Math.min(1e6, s.cax)) : undefined,
+			cay: (s.al && typeof s.cay === 'number' && isFinite(s.cay)) ? Math.max(-1e6, Math.min(1e6, s.cay)) : undefined,
+			caz: (s.al && typeof s.caz === 'number' && isFinite(s.caz)) ? Math.max(-1e6, Math.min(1e6, s.caz)) : undefined,
 		});
 	});
 	// ---- 1.75.x: encounter-aware town matchmaking ----
@@ -793,6 +809,20 @@ function handleConnection(socket) {
 		const locked = !!(data && data.locked);
 		const map = (data && typeof data.map === 'string' && data.map.length <= 128) ? data.map : '';
 		world.setHostEncounter(username, locked, map);
+	});
+	// ---- 1.75.x: boss-phase quick revive ----
+	// The instance HOST crossed a boss hpBreak threshold or started a boss phase
+	// COMBAT_CUTSCENE. Relay it to the instance so every soft-dead member revives
+	// immediately instead of waiting out the boss revive countdown. Host-only like
+	// entityState: broadcastHostState no-ops unless the sender IS the instance host.
+	socket.on('bossPhase', function (data) {
+		if (dropIfNotAuthed('bossPhase')) return;
+		if (rateLimited('bossPhase', 2)) return;
+		if (!data || typeof data.map !== 'string' || !data.map || data.map.length > 128) return;
+		const uid = (typeof data.uid === 'number' && isFinite(data.uid))
+			? Math.max(0, Math.round(data.uid))
+			: 0;
+		world.broadcastHostState(ctx, username, 'bossPhase', { map: data.map, uid });
 	});
 	// ---- round 82: door-open visual sync ----
 	// When a player walks into a mapped door their client broadcasts the door so the
@@ -990,6 +1020,104 @@ function handleConnection(socket) {
 			...(radius !== undefined ? { radius } : {}),
 			...(speed !== undefined ? { speed } : {}),
 		});
+	});
+
+	// ---- 1.75.x: quest enemy AR label relay (深度呵护 [饥饿的叫声]/[舔树]) ----
+	// A real enemy ACTION_STEP.SHOW_AR_MSG just showed a floating label. Relay the
+	// LangLabel data so every other client replays it on its matching puppet/csPuppet
+	// (resolved in the receiver's own language). Auth + rate limited; whitelisted.
+	socket.on('enemyArMsg', function (data) {
+		if (dropIfNotAuthed('enemyArMsg')) return;
+		if (rateLimited('enemyArMsg', 20)) return;
+		if (!data || typeof data.uid !== 'number' || !isFinite(data.uid)) return;
+		let label = null;
+		if (typeof data.label === 'string') {
+			label = data.label.slice(0, 96);
+			if (!label) return;
+		} else if (data.label && typeof data.label === 'object') {
+			const out = {};
+			let n = 0;
+			for (const k in data.label) {
+				if (n >= 12) break;
+				const v = data.label[k];
+				if (typeof k === 'string' && /^[a-z]{2}_[A-Z]{2}$/.test(k) && typeof v === 'string' && v.length <= 96) {
+					out[k] = v; n++;
+				}
+			}
+			if (!n) return;
+			label = out;
+		} else return;
+		let time = Number(data.time);
+		if (!isFinite(time) || time < 0 || time > 60) time = 1;
+		let mode = Number(data.mode);
+		if (!isFinite(mode) || mode < 0 || mode > 2) mode = 0;
+		let color = Number(data.color);
+		if (!isFinite(color) || color < 0 || color > 1) color = 0;
+		world.broadcastToInstance(ctx, username, 'enemyArMsg', {
+			uid: Math.round(data.uid),
+			label,
+			time,
+			mode,
+			color,
+		});
+	});
+
+	// ---- 1.76.x: barrier-denial FX relay (拒绝访问 + 红网屏障闪烁) ----
+	// A player bumped a locked red barrier: the local BarrierBlock parallel event
+	// shows the "Access denied" AR window on the player and a barrierFlash on the
+	// barrier prop — both LOCAL-only in vanilla. kind 'ar' = AR text anchored on
+	// the denied player's mirror (label = LangLabel map, per-receiver language);
+	// kind 'flash' = a fixed-position world effect (sheet map.barrier, key
+	// barrierFlash) at the barrier's bottom-center anchor. The sender is excluded
+	// by broadcastToInstance; receivers gate on their own mirror existing.
+	socket.on('playerFx', function (data) {
+		if (dropIfNotAuthed('playerFx')) return;
+		if (rateLimited('playerFx', 20)) return;
+		if (!data) return;
+		const pl = typeof data.pl === 'string' ? data.pl.slice(0, 32) : '';
+		if (!/^[\w.\-]{1,32}$/.test(pl)) return;
+		if (data.kind === 'hover') {
+			// 1.76.x: the denial drag-back began (entryBlockedHover ring on the player)
+			// — receivers pin the hover pose on the mirror + the particle ring until
+			// the mirror lands (their own z watcher) or a 4s cap.
+			const key = typeof data.key === 'string' ? data.key.slice(0, 48) : '';
+			if (!/^[\w.\-]{1,48}$/.test(key)) return;
+			world.broadcastToInstance(ctx, username, 'playerFx', { pl, kind: 'hover', key });
+			return;
+		}
+		if (data.kind === 'flash') {
+			const sheet = typeof data.sheet === 'string' ? data.sheet.slice(0, 48) : '';
+			const key = typeof data.key === 'string' ? data.key.slice(0, 48) : '';
+			if (!/^[\w.\-]{1,48}$/.test(sheet) || !/^[\w.\-]{1,48}$/.test(key)) return;
+			const x = Number(data.x), y = Number(data.y), z = Number(data.z);
+			if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return;
+			world.broadcastToInstance(ctx, username, 'playerFx', { pl, kind: 'flash', sheet, key, x, y, z });
+			return;
+		}
+		let label = null;
+		if (typeof data.label === 'string') {
+			label = data.label.slice(0, 96);
+			if (!label) return;
+		} else if (data.label && typeof data.label === 'object') {
+			const out = {};
+			let n = 0;
+			for (const k in data.label) {
+				if (n >= 12) break;
+				const v = data.label[k];
+				if (typeof k === 'string' && /^[a-z]{2}_[A-Z]{2}$/.test(k) && typeof v === 'string' && v.length <= 96) {
+					out[k] = v; n++;
+				}
+			}
+			if (!n) return;
+			label = out;
+		} else return;
+		let time = Number(data.time);
+		if (!isFinite(time) || time < 0 || time > 60) time = 1;
+		let mode = Number(data.mode);
+		if (!isFinite(mode) || mode < 0 || mode > 2) mode = 0;
+		let color = Number(data.color);
+		if (!isFinite(color) || color < 0 || color > 1) color = 0;
+		world.broadcastToInstance(ctx, username, 'playerFx', { pl, kind: 'ar', label, time, mode, color });
 	});
 
 	// ---- 1.72.0: combat-art NAME banner relay (显示战技名) ----
@@ -1356,6 +1484,66 @@ function handleConnection(socket) {
 			}
 			if (hs.length) hints = hs;
 		}
+		// 1.75.x (saw-suction fix): carry the real attack's stunSteps so hold/pull
+		// arts (START_LOCK / BLOCK_XY / PULL / Z_PULL / ...) run on the host's real
+		// enemy. Whitelist type + scalar settings; every other field is dropped.
+		let stunSteps = null;
+		if (Array.isArray(data.stunSteps)) {
+			const STUN_FIELDS = {
+				START_LOCK: [], END_LOCK: [], BLOCK_XY: [],
+				BLOCK_FALL: ['maxTime'],
+				PULL: ['distance', 'speed', 'maxTime'],
+				Z_PULL: ['maxSpeed', 'accel', 'offZ', 'maxTime'],
+				FORCE_POS: ['align', 'offset', 'maxTime', 'interpolateFactor'],
+				Z_VEL: ['value'], Z_BOUNCINESS: ['value'],
+				SET_FACE: ['faces', 'invert'],
+			};
+			const num = function (v, dflt) {
+				const n = Number(v);
+				if (!isFinite(n)) return dflt;
+				if (n < -100000) return -100000;
+				if (n > 100000) return 100000;
+				return n;
+			};
+			const ss = [];
+			for (const e0 of data.stunSteps) {
+				if (!e0 || typeof e0 !== 'object' || typeof e0.type !== 'string') continue;
+				if (!Object.prototype.hasOwnProperty.call(STUN_FIELDS, e0.type)) continue;
+				const fields = STUN_FIELDS[e0.type];
+				if (!fields) continue;
+				const step = { type: e0.type };
+				for (const k of fields) {
+					const v = e0[k];
+					if (v === undefined) continue;
+					if (k === 'align') {
+						if (typeof v === 'string' && /^[A-Z][A-Z0-9_]{0,31}$/.test(v)) step.align = v;
+					} else if (k === 'offset') {
+						if (v && typeof v === 'object') {
+							const x = Number(v.x), y = Number(v.y), z = Number(v.z);
+							if (isFinite(x) && isFinite(y) && isFinite(z)) {
+								step.offset = { x: num(x, 0), y: num(y, 0), z: num(z, 0) };
+							}
+						}
+					} else if (k === 'faces') {
+						if (Array.isArray(v)) {
+							const fs = [];
+							for (const f of v) {
+								if (typeof f !== 'string' || !f || f.length > 32 || fs.length >= 8) continue;
+								if (fs.indexOf(f) === -1) fs.push(f);
+							}
+							if (fs.length) step.faces = fs;
+						}
+					} else if (k === 'invert') {
+						step.invert = v === true;
+					} else if (typeof v === 'number' && isFinite(v)) {
+						step[k] = num(v, 0);
+					}
+				}
+				ss.push(step);
+				if (ss.length >= 4) break;
+			}
+			if (ss.length) stunSteps = ss;
+		}
 		// 1.74.x (ball impact feel): the attacker's LOCAL hit coordinates — its ball
 		// died where IT saw the enemy (its view lags the host's real enemy). Every
 		// receiver uses THIS point as the ball-puppet kill point, so the puppet
@@ -1378,6 +1566,8 @@ function handleConnection(socket) {
 			off: off,
 			def: def,
 			hints: hints,
+			// 1.75.x: whitelisted stun steps (hold/pull) for the host's real enemy.
+			stunSteps: stunSteps,
 			// Elemental status: the ATTACKER-side portion of the engine's inflict
 			// formula (damageFactor × statusInflict × focus-ratio × COND_EFFECT), so
 			// the host's real enemy accumulates burn/chill/etc. from member attacks.
@@ -1483,6 +1673,28 @@ function handleConnection(socket) {
 		if (!data || typeof data.mapId !== 'number' || !Number.isInteger(data.mapId) || data.mapId <= 0) return;
 		if (typeof data.map !== 'string' || data.map.length === 0 || data.map.length > 128) return;
 		world.broadcastToInstance(ctx, username, 'plantBreak', { map: data.map, mapId: data.mapId });
+	});
+
+	// ---- ROUND 141: prop hit-FX sync ----
+	// A player's ball/melee hit a map destructible (plant / ice block / regen pillar)
+	// and the vanilla impact flash played on the sender. Relay the impact point so every
+	// OTHER same-instance client replays the flash on its own intact copy of the prop.
+	// Cosmetic only, whitelisted field-by-field, sender excluded, solo never sends.
+	socket.on('propHitFx', function (data) {
+		if (dropIfNotAuthed('propHitFx')) return;
+		if (rateLimited('propHitFx', 12)) return;
+		if (!data || typeof data.mapId !== 'number' || !Number.isInteger(data.mapId) || data.mapId <= 0) return;
+		if (typeof data.map !== 'string' || data.map.length === 0 || data.map.length > 128) return;
+		const num = (v) => (typeof v === 'number' && isFinite(v)) ? Math.round(v) : null;
+		const x = num(data.x), y = num(data.y), z = num(data.z);
+		if (x === null || y === null || z === null) return;
+		if (Math.abs(x) > 200000 || Math.abs(y) > 200000 || Math.abs(z) > 10000) return;
+		const el = num(data.el), at = num(data.at);
+		world.broadcastToInstance(ctx, username, 'propHitFx', {
+			map: data.map, mapId: data.mapId, x, y, z,
+			el: (el !== null && el >= 0 && el <= 4) ? el : 0,
+			at: (at !== null && at >= 0 && at <= 4) ? at : 0,
+		});
 	});
 
 	// ---- ROUND 100: drop-pickup visibility relay ----
@@ -1839,6 +2051,12 @@ function handleConnection(socket) {
 		if (!data) return;
 		world.broadcastToInstance(ctx, username, 'updatePlayerStats', {
 			player: username, hp: data.hp, maxHp: data.maxHp, sp: data.sp, maxSp: data.maxSp,
+			// Element badge (party-HUD portrait icon + overload fill): element mode 0-4,
+			// element load 0-1 (quantized), overload flag. Validated so malformed packets
+			// cannot smuggle junk onto other clients HUDs.
+			em: (typeof data.em === 'number' && isFinite(data.em) && data.em >= 0 && data.em <= 4) ? Math.floor(data.em) : undefined,
+			el: (typeof data.el === 'number' && isFinite(data.el)) ? Math.max(0, Math.min(1, data.el)) : undefined,
+			ov: data.ov === true ? true : undefined,
 		});
 	});
 
@@ -2782,6 +3000,13 @@ function handleConnection(socket) {
 		let target = (data && typeof data.target === 'string' && p.members.indexOf(data.target) !== -1)
 			? data.target : p.leader;
 		if (!target || target === username) return;
+		// 1.75.x: the target is mid-encounter/boss-fight — refuse the regroup with
+		// a reason (blocked:'combat') instead of dropping the requester into a
+		// locked room. The client toasts the refusal and stays put.
+		if (world.isMemberInCombat && world.isMemberInCombat(target)) {
+			socket.emit('partyMove', { leader: target, blocked: 'combat' });
+			return;
+		}
 		const loc = world.getMemberLocation(target);
 		// Only send a regroup when we actually know where the target is;
 		// otherwise the requester would get a null map and teleport nowhere.

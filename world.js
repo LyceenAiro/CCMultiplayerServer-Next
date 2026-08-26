@@ -118,7 +118,19 @@ World.prototype.instanceIdFor = function (username, mapName, areaType, ctx) {
 	}
 	const partyId = party.partyOf(username);
 	if (partyId) {
-		return 'party:' + partyId + ':' + mapName;
+		const pid = 'party:' + partyId + ':' + mapName;
+		// 1.75.x (encounter/boss room gate): the party room on this map is
+		// mid-encounter/boss-fight (its host reported forceCombatMode). A player
+		// who is NOT already inside that room must not match into it mid-fight —
+		// route them to a solo room on the same map instead. Players already in
+		// the room (userInstance === pid) and the room's host keep it.
+		const pinst = this.instances[pid];
+		if (pinst && this.userInstance[username] !== pid && pinst.host !== username
+			&& pinst.hostInEncounter
+			&& (!pinst.hostCombatMap || pinst.hostCombatMap === mapName)) {
+			return 'solo:' + username + ':' + mapName;
+		}
+		return pid;
 	}
 	return 'solo:' + username + ':' + mapName;
 };
@@ -167,6 +179,18 @@ World.prototype.setHostEncounter = function (username, locked, mapName) {
 		console.log('[world] instance ' + instanceId + ' host ' + username
 			+ (next ? ' entered encounter on ' + inst.hostCombatMap + ' (room join blocked)' : ' encounter ended (joinable)'));
 	}
+};
+
+// 1.75.x: true when the player's CURRENT room is mid-encounter/boss-fight — the
+// room's host reported the combat lock and the player is on the locked sub-map
+// (a town-channel member standing on a different sub-map is not in the fight).
+// Used to refuse regroup teleports onto a fighting teammate.
+World.prototype.isMemberInCombat = function (username) {
+	const instanceId = this.userInstance[username];
+	const inst = instanceId && this.instances[instanceId];
+	if (!inst || !inst.hostInEncounter) return false;
+	const map = (inst.memberMap && inst.memberMap[username]) || inst.mapName || '';
+	return !inst.hostCombatMap || inst.hostCombatMap === map;
 };
 
 // Whether the given user is the block host of whatever instance they are CURRENTLY
