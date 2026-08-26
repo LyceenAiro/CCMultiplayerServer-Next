@@ -108,7 +108,7 @@ const DEFAULTS = {
 // Round 17: mod version. The server rejects any client whose mod version differs
 // (handshake gate in protocol.js). Bump this TOGETHER with the client mod version
 // (client src/multiplayer.ts MP_VERSION + package.json "version") on every release.
-const MOD_VERSION = '1.75.0';
+const MOD_VERSION = '2.0.0';
 
 function loadConfig() {
 	const cfg = Object.assign({}, DEFAULTS);

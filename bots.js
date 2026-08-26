@@ -7,7 +7,7 @@
 // AUTO-ACCEPTS instantly (the bot can't log in to accept).
 //
 // BOT_NAMES is the canonical server-side list. It MUST match the client's list
-// in CCMultiplayerClient/src/ui/socialMenuInject.ts (BOT_ACCOUNTS) EXACTLY —
+// in CCMultiplayerClient-Next/src/ui/socialMenuInject.ts (BOT_ACCOUNTS) EXACTLY —
 // same spelling, same order. Names are the companions' in-game names as players
 // know them (Emilie = emilie's realname, C'tron = the 'Glasses' character's
 // name, Lukas = the 'Luke' character's realname; the rest match their native

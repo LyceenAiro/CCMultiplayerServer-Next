@@ -5,7 +5,7 @@
 [![Discord Server](<https://img.shields.io/discord/382339402338402315.svg?label=Discord%20Server>)](https://discord.gg/SJmMZKy)
 
 CrossCode 多人模组
-[CCMultiplayerClient-Next](https://github.com/LyceenAiro/CCMultiplayerClient)
+[CCMultiplayerClient-Next](https://github.com/LyceenAiro/CCMultiplayerClient-Next)
 的**中继服务器**。
 
 它是一个小型的 Node.js + socket.io **消息中继**:客户端之间从不直接通信,
@@ -69,7 +69,7 @@ PORT=8080 npm start
   (仅用于开发;正常作为中继使用时并不需要)。
 
 完整的事件列表见客户端 README 的
-[网络协议](https://github.com/CCDirectLink/CCMultiplayerClient#network-protocol)
+[网络协议](https://github.com/LyceenAiro/CCMultiplayerClient-Next#network-protocol)
 一节。
 
 ## 技术栈

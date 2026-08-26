@@ -5,7 +5,7 @@
 [![Discord Server](https://img.shields.io/discord/382339402338402315.svg?label=Discord%20Server)](https://discord.gg/SJmMZKy)
 
 Relay server for the CrossCode multiplayer mod,
-[CCMultiplayerClient-Next](https://github.com/LyceenAiro/CCMultiplayerClient).
+[CCMultiplayerClient-Next](https://github.com/LyceenAiro/CCMultiplayerClient-Next).
 
 It is a small Node.js + socket.io **message relay**: clients never talk to each
 other directly, every position/animation/entity update is sent here and
