@@ -68,6 +68,18 @@
 //                       ~3s quick revive and are not configurable. All four values
 //                       are sent to clients under the same names in the
 //                       handshakeResponse.
+//   perfectGuardBaseMs  member-side perfect-guard compensation, BASE grace in
+//                       MILLISECONDS: after a monster's hit lands on a member,
+//                       raising guard within this window still counts as a PERFECT
+//                       guard (the hit deals no damage while the window is open).
+//                       Default 30; 0 disables the base part; negatives clamp to 0.
+//   perfectGuardPingFactor
+//                       member-side perfect-guard compensation, NETWORK part: the
+//                       window above is extended by factor x the member's measured
+//                       round-trip latency to the host (0.6 x ping by default).
+//                       Stacks with perfectGuardBaseMs. 0 disables the network
+//                       part; negatives clamp to 0. Both values are sent to
+//                       clients in the handshakeResponse.
 const fs = require('fs');
 const path = require('path');
 
@@ -103,6 +115,10 @@ const DEFAULTS = {
 	softDeathReviveHpBoss: 0.25,
 	softDeathReviveTimeNormal: 30,
 	softDeathReviveTimeBoss: 30,
+	// Member perfect-guard compensation: base grace window (ms) + ping-scaled
+	// extension (factor x RTT). Each part disables at 0; both stack.
+	perfectGuardBaseMs: 30,
+	perfectGuardPingFactor: 0.6,
 };
 
 // Round 17: mod version. The server rejects any client whose mod version differs
@@ -153,6 +169,17 @@ function loadConfig() {
 	};
 	cfg.softDeathReviveTimeNormal = clampReviveSec('softDeathReviveTimeNormal', DEFAULTS.softDeathReviveTimeNormal);
 	cfg.softDeathReviveTimeBoss = clampReviveSec('softDeathReviveTimeBoss', DEFAULTS.softDeathReviveTimeBoss);
+	// Perfect-guard compensation: non-negative only (0 = that part off). A
+	// non-number falls back to the default; a negative clamps to 0; absurd values
+	// cap at 5000ms / factor 10 so a typo can't defer member damage forever.
+	const clampNonNeg = (key, def, max) => {
+		const v = Number(cfg[key]);
+		if (!isFinite(v)) return def;
+		if (v < 0) return 0;
+		return v > max ? max : v;
+	};
+	cfg.perfectGuardBaseMs = clampNonNeg('perfectGuardBaseMs', DEFAULTS.perfectGuardBaseMs, 5000);
+	cfg.perfectGuardPingFactor = clampNonNeg('perfectGuardPingFactor', DEFAULTS.perfectGuardPingFactor, 10);
 	// Clamp the save bandwidth caps to a sane finite range [1, 65536] kb/s so a
 	// config typo can't turn the save stream into a firehose or a crawl.
 	const clampKbS = (key, def) => {

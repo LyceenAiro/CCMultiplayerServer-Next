@@ -571,6 +571,12 @@ function handleConnection(socket) {
 			softDeathReviveHpBoss: config.softDeathReviveHpBoss,
 			softDeathReviveTimeNormal: config.softDeathReviveTimeNormal,
 			softDeathReviveTimeBoss: config.softDeathReviveTimeBoss,
+			// Member perfect-guard compensation (config.json): after a monster hit
+			// lands on a member, raising guard within (perfectGuardBaseMs +
+			// perfectGuardPingFactor x RTT) still counts as PERFECT and the hit deals
+			// no damage while that window is open. Each part disables at 0.
+			perfectGuardBaseMs: config.perfectGuardBaseMs,
+			perfectGuardPingFactor: config.perfectGuardPingFactor,
 			// Round 17: the accepted server version (harmless; useful for logs — the
 			// client already sent its own version in the handshake payload).
 			version: config.version,
@@ -1147,7 +1153,13 @@ function handleConnection(socket) {
 			if (!n) return;
 			label = out;
 		} else return;
-		world.broadcastToInstance(ctx, username, 'combatArtName', { player: username, label });
+		world.broadcastToInstance(ctx, username, 'combatArtName', {
+			player: username,
+			// 1.76.x (bot attack sync): the art was released by one of the sender's
+			// party BOTs — receivers raise the banner on that bot's puppet.
+			bot: (typeof data.bot === 'string' && /^[\w.\-]{1,32}$/.test(data.bot)) ? data.bot : undefined,
+			label,
+		});
 	});
 
 	// ---- round 39 (item 1): a client RELEASED a sustained (looped) sound ----
@@ -1286,6 +1298,9 @@ function handleConnection(socket) {
 		if (data.sheet.length > 64 || data.key.length > 64) return;
 		world.broadcastToInstance(ctx, username, 'skillFx', {
 			player: username,
+			// 1.76.x (bot attack sync): the effect belongs to one of the sender's
+			// party BOTs — receivers anchor the replay on that bot's puppet.
+			bot: (typeof data.bot === 'string' && /^[\w.\-]{1,32}$/.test(data.bot)) ? data.bot : undefined,
 			sheet: data.sheet,
 			key: data.key,
 			f: (data.f && typeof data.f.x === 'number' && typeof data.f.y === 'number' && typeof data.f.z === 'number')
@@ -1306,6 +1321,8 @@ function handleConnection(socket) {
 		if (data.sheet.length > 64 || data.key.length > 64) return;
 		world.broadcastToInstance(ctx, username, 'skillFxStop', {
 			player: username,
+			// 1.76.x (bot attack sync): end a BOT-owned looping skill replay.
+			bot: (typeof data.bot === 'string' && /^[\w.\-]{1,32}$/.test(data.bot)) ? data.bot : undefined,
 			sheet: data.sheet,
 			key: data.key,
 		});
@@ -1382,6 +1399,10 @@ function handleConnection(socket) {
 			// MASSIVE), relayed from hitProps.visualType so the member plays the correct
 			// hit sound (a hardcoded LIGHT made every melee hit sound like a ball-hit).
 			attackType: typeof data.attackType === 'number' && isFinite(data.attackType) && data.attackType > 0 ? data.attackType : undefined,
+			// Perfect-guard compensation: the attacker enemy's uid, echoed back by the
+			// member via latePerfectGuard when a deferred verdict converts to PERFECT
+			// (the host needs it to find the enemy for the GUARD_COUNTER reaction).
+			auid: typeof data.auid === 'number' && isFinite(data.auid) && data.auid > 0 ? Math.round(data.auid) : undefined,
 			// ROUND 79: guard-bar drain (engine's ratio^1.5 value, NOT the HP chip) and the
 			// FULL unguarded hit for the bar-break case. The host's recompute emits both on
 			// regular-guard verdicts; the member's applyCombatHit feeds the bar with
@@ -1593,6 +1614,22 @@ function handleConnection(socket) {
 			uid: data.uid,
 			damage: Math.round(dmg),
 			guarded: data.guarded,
+		});
+	});
+
+	// latePerfectGuard: a MEMBER converted a deferred monster verdict into a
+	// PERFECT guard locally (perfect-guard compensation window: config
+	// perfectGuardBaseMs + perfectGuardPingFactor). The host runs the attacker's
+	// GUARD_COUNTER reaction + the mirror FX. Instance-scoped, sender excluded;
+	// the payload is stamped with the sender's name so the host knows WHO
+	// perfect-guarded (and on which mirror to render).
+	socket.on('latePerfectGuard', function (data) {
+		if (dropIfNotAuthed('latePerfectGuard')) return;
+		if (rateLimited('latePerfectGuard', 20)) return;
+		const auid = data && Number(data.auid);
+		world.broadcastToInstance(ctx, username, 'latePerfectGuard', {
+			player: username,
+			auid: (isFinite(auid) && auid > 0) ? Math.round(auid) : 0,
 		});
 	});
 
