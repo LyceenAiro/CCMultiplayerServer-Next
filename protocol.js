@@ -1641,7 +1641,16 @@ function handleConnection(socket) {
 		if (typeof t !== 'number' || !Number.isInteger(t) || t < 1 || t > 32) return;
 		const fallPartyId = party.partyOf(username);
 		if (!fallPartyId) return;
-		emitToParty(fallPartyId, 'playerFall', { from: username, t }, username);
+		// 1.76.x: forward the owner's respawn anchor (x/y/z) so the receiving
+		// mirror's respawnLine beam targets the real revive point. Optional —
+		// old clients omit it, receivers treat it as absent.
+		const pkt = { from: username, t };
+		if (typeof data.x === 'number' && typeof data.y === 'number' && typeof data.z === 'number'
+			&& Number.isFinite(data.x) && Number.isFinite(data.y) && Number.isFinite(data.z)
+			&& Math.abs(data.x) < 1e7 && Math.abs(data.y) < 1e7 && Math.abs(data.z) < 1e6) {
+			pkt.x = data.x; pkt.y = data.y; pkt.z = data.z;
+		}
+		emitToParty(fallPartyId, 'playerFall', pkt, username);
 	});
 
 	// cutsceneTrigger: a story-gated dungeon CUTSCENE EventTrigger (triggerType
@@ -1761,6 +1770,21 @@ function handleConnection(socket) {
 		world.broadcastToInstance(ctx, username, 'puzzleState', { map: data.map, entries: out });
 	});
 
+	// 1.76.x (bounce-puzzle FX relay): a client's ball lit a bounce block / hit
+	// the group end-switch (final or fail) / the group reset. The sounds and the
+	// red fail-flash are local-only vanilla side effects; relay one compact event
+	// so same-instance peers replay them natively. k: 1=blockHit 2=switchFinal
+	// 3=switchFail 4=groupReset (mi = endSwitch mapId).
+	socket.on('bounceFx', function (data) {
+		if (dropIfNotAuthed('bounceFx')) return;
+		if (rateLimited('bounceFx', 10)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96) return;
+		if (typeof data.mi !== 'number' || !Number.isInteger(data.mi) || data.mi <= 0) return;
+		const k = data.k;
+		if (typeof k !== 'number' || !Number.isInteger(k) || k < 1 || k > 4) return;
+		world.broadcastToInstance(ctx, username, 'bounceFx', { map: data.map, mi: data.mi, k });
+	});
+
 	// 1.73.x: the host's EnemyCounter reached 0 (battle done). Members' counters
 	// never count puppet deaths, so the relayed battle-done cutscene would block
 	// forever on its post variable. Host relays the resolution once; receivers set
@@ -1835,6 +1859,26 @@ function handleConnection(socket) {
 		}
 		if (!out.length) return;
 		world.broadcastToInstance(ctx, username, 'bombState', { map: data.map, entries: out });
+	});
+
+	// 1.76.x (bomb handoff): the bomb's owner is leaving the map mid-fuse —
+	// relay the full bomb state so the instance host (or the new host after
+	// migration) adopts it as a real bomb. Same field shape as a bombState entry.
+	socket.on('bombHandoff', function (data) {
+		if (dropIfNotAuthed('bombHandoff')) return;
+		if (rateLimited('bombHandoff', 10)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96) return;
+		if (typeof data.i !== 'number' || !Number.isInteger(data.i) || data.i <= 0) return;
+		const num = (v) => (typeof v === 'number' && isFinite(v)) ? Math.round(v) : 0;
+		world.broadcastToInstance(ctx, username, 'bombHandoff', {
+			map: data.map,
+			i: data.i,
+			pmi: num(data.pmi),
+			x: num(data.x), y: num(data.y), z: num(data.z),
+			vx: num(data.vx), vy: num(data.vy), vz: num(data.vz),
+			t: (typeof data.t === 'number' && isFinite(data.t)) ? Math.min(Math.max(data.t, 0), 30) : 0,
+			h: data.h === 1 ? 1 : 0,
+		});
 	});
 
 	// 1.73.x: the triggering client's bomb exploded — peers play the boom and reset
