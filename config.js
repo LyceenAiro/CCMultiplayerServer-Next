@@ -14,8 +14,8 @@
 //   monsterBossHpPerPlayer
 //                       extra max-HP fraction for BOSS enemies ONLY (enemyType
 //                       .boss on the client), same per-ADDITIONAL-player scheme.
-//                       Default 0.9 = +90% max HP per extra player (a 3-player
-//                       room faces bosses at x2.8 HP). Sent as hpScaleBoss in
+//                       Default 1.0 = +100% max HP per extra player (a 3-player
+//                       room faces bosses at x3 HP). Sent as hpScaleBoss in
 //                       the handshakeResponse; regular enemies keep using
 //                       monsterHpPerPlayer.
 //   monsterBreakPerPlayer
@@ -72,7 +72,7 @@
 //                       MILLISECONDS: after a monster's hit lands on a member,
 //                       raising guard within this window still counts as a PERFECT
 //                       guard (the hit deals no damage while the window is open).
-//                       Default 30; 0 disables the base part; negatives clamp to 0.
+//                       Default 10; 0 disables the base part; negatives clamp to 0.
 //   perfectGuardPingFactor
 //                       member-side perfect-guard compensation, NETWORK part: the
 //                       window above is extended by factor x the member's measured
@@ -88,8 +88,8 @@ const CONFIG_FILE = path.join(__dirname, 'config.json');
 const DEFAULTS = {
 	monsterHpPerPlayer: 0.7,
 	// 1.76.x: separate per-extra-member HP increment for bosses (enemyType.boss);
-	// default +90% per extra party member.
-	monsterBossHpPerPlayer: 0.9,
+	// default +100% per extra party member.
+	monsterBossHpPerPlayer: 1.0,
 	monsterBreakPerPlayer: 0.7,
 	monsterStatusThresholdPerPlayer: 0.6,
 	monsterAttackPerPlayer: 0.1,
@@ -117,14 +117,14 @@ const DEFAULTS = {
 	softDeathReviveTimeBoss: 30,
 	// Member perfect-guard compensation: base grace window (ms) + ping-scaled
 	// extension (factor x RTT). Each part disables at 0; both stack.
-	perfectGuardBaseMs: 30,
+	perfectGuardBaseMs: 10,
 	perfectGuardPingFactor: 0.6,
 };
 
 // Round 17: mod version. The server rejects any client whose mod version differs
 // (handshake gate in protocol.js). Bump this TOGETHER with the client mod version
 // (client src/multiplayer.ts MP_VERSION + package.json "version") on every release.
-const MOD_VERSION = '2.0.0';
+const MOD_VERSION = '2.2.0';
 
 function loadConfig() {
 	const cfg = Object.assign({}, DEFAULTS);

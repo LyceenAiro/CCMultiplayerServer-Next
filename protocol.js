@@ -1126,6 +1126,51 @@ function handleConnection(socket) {
 		world.broadcastToInstance(ctx, username, 'playerFx', { pl, kind: 'ar', label, time, mode, color });
 	});
 
+	// ---- 1.76.x: puzzle FX relay (Faj'ro torches / streamed-ball wall FX) ----
+	// The temple puzzles run local-only in vanilla: a thrown ball's bounce /
+	// wall-death / air-expiry effects and the whole ElementPole torch charge
+	// chain only execute on the thrower's client. Kinds:
+	//   pole       { pl, m: pole mapId, el: element 0-4, bi: ball uid } —
+	//              receivers resolve the torch by mapId and run the identical
+	//              ballHit chain (charge FX + group bookkeeping + dest turnOn).
+	//   poleCancel { pl, g: group name } — the thrower's ball died with the
+	//              group mid-charge; receivers reset the same group.
+	//   ball       { pl, t: 'b'|'w'|'a', i: ball uid, x/y/z, ang? } — replay
+	//              ballBounce / ballWallKill / ballAirKill on the receiver's
+	//              puppet at the thrower's exact impact point + wall angle.
+	socket.on('puzzleFx', function (data) {
+		if (dropIfNotAuthed('puzzleFx')) return;
+		if (rateLimited('puzzleFx', 40)) return;
+		if (!data) return;
+		const pl = typeof data.pl === 'string' ? data.pl.slice(0, 32) : '';
+		if (!/^[\w.\-]{1,32}$/.test(pl)) return;
+		if (data.k === 'pole') {
+			const m = Number(data.m), el = Number(data.el), bi = Number(data.bi);
+			if (!Number.isInteger(m) || m < 0 || m > 1e9) return;
+			if (!Number.isInteger(el) || el < 0 || el > 4) return;
+			if (!Number.isInteger(bi) || bi < 0) return;
+			world.broadcastToInstance(ctx, username, 'puzzleFx', { pl, k: 'pole', m, el, bi });
+			return;
+		}
+		if (data.k === 'poleCancel') {
+			const g = typeof data.g === 'string' ? data.g.slice(0, 32) : '';
+			if (!/^[\w.\-]{1,32}$/.test(g)) return;
+			world.broadcastToInstance(ctx, username, 'puzzleFx', { pl, k: 'poleCancel', g });
+			return;
+		}
+		if (data.k === 'ball') {
+			const t = data.t;
+			if (t !== 'b' && t !== 'w' && t !== 'a') return;
+			const i = Number(data.i), x = Number(data.x), y = Number(data.y), z = Number(data.z);
+			if (!Number.isInteger(i) || i < 0) return;
+			if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return;
+			const ang = Number(data.ang);
+			const out = { pl, k: 'ball', t, i, x: Math.round(x), y: Math.round(y), z: Math.round(z) };
+			if (isFinite(ang)) out.ang = Math.round(ang * 100) / 100;
+			world.broadcastToInstance(ctx, username, 'puzzleFx', out);
+		}
+	});
+
 	// ---- 1.72.0: combat-art NAME banner relay (显示战技名) ----
 	// The vanilla banner (sc.SmallEntityBox) is spawned locally on the caster
 	// only. Relay the art's LangLabel data ({langCode: text} map) so teammates
@@ -1367,9 +1412,14 @@ function handleConnection(socket) {
 		// ROUND 27: a PERFECT-guard hit carries damage 0 (the member plays the counter
 		// window + FX even though no HP is lost), so allow 0 — but ONLY for a flagged
 		// monster hit. Every other hit still requires damage > 0.
+		// 1.76.x: a REGULAR guard against a much weaker enemy legitimately chips 0 HP
+		// (the engine's guard formula rounds to 0) — the verdict still carries the
+		// guard-block number/sound/FX + the guard-bar drain, so it must pass too.
+		// The old gate dropped exactly those packets: the member saw NOTHING per hit
+		// and read as immune while the host's own native guard showed a 0 number.
 		const isMonster = data.monster === true;
 		if (!isFinite(dmg) || dmg > 100000) return;
-		if (dmg <= 0 && !(isMonster && data.perfect === true)) return;
+		if (dmg <= 0 && !(isMonster && (data.perfect === true || data.regular === true))) return;
 		world.broadcastToInstance(ctx, username, 'combatHit', {
 			player: data.player,
 			damage: Math.round(dmg),
@@ -1407,7 +1457,11 @@ function handleConnection(socket) {
 			// FULL unguarded hit for the bar-break case. The host's recompute emits both on
 			// regular-guard verdicts; the member's applyCombatHit feeds the bar with
 			// shieldDmg and falls back to the full hit when the bar breaks.
-			shieldDmg: (typeof data.shieldDmg === 'number' && isFinite(data.shieldDmg) && data.shieldDmg >= 0) ? Math.round(data.shieldDmg) : undefined,
+			// 1.76.x: keep 3 decimals — the engine's bar drain is a FLOAT accumulator
+			// (damageShield adds ratio^1.5/7 per hit); the old integer rounding zeroed
+			// the drain vs much weaker enemies so the bar could NEVER break (vanilla
+			// breaks it after enough guarded hits).
+			shieldDmg: (typeof data.shieldDmg === 'number' && isFinite(data.shieldDmg) && data.shieldDmg >= 0) ? Math.round(data.shieldDmg * 1000) / 1000 : undefined,
 			full: (typeof data.full === 'number' && isFinite(data.full) && data.full > 0) ? Math.round(data.full) : undefined,
 			// ROUND 43 (enemy-hurt sound for teammates): the attacker's ATTACK ELEMENT,
 			// forwarded from the member's local hit so every spectator can re-run
@@ -2006,6 +2060,97 @@ function handleConnection(socket) {
 			hy: opt(data.hy),
 			vx: opt(data.vx),
 			vy: opt(data.vy),
+		});
+	});
+
+	// ---- 1.77.x: water-bubble host authority (Faj'ro Temple bubble puzzles) ----
+	// The instance host streams per-panel bubble phase (0 none / 1 bubble / 2 ice
+	// disk / 3 cooled coals) + state + (while anything flies) position/velocity.
+	// Any client -> same-instance others; receivers ignore it while THEY are host.
+	socket.on('bubbleState', function (data) {
+		if (dropIfNotAuthed('bubbleState')) return;
+		if (rateLimited('bubbleState', 60)) return; // 30Hz fast stream + 10Hz scan
+		if (!data || typeof data.map !== 'string' || data.map.length > 96 || !Array.isArray(data.entries)) return;
+		const out = [];
+		const cleanSid = (v) => (typeof v === 'string' && v.length >= 1 && v.length <= 24 && /^[0-9A-Za-z.:_-]+$/.test(v)) ? v : '';
+		for (const e of data.entries) {
+			if (!e || typeof e !== 'object') continue;
+			const hasMi = typeof e.mi === 'number' && Number.isInteger(e.mi) && e.mi > 0;
+			const sid = cleanSid(e.sid);
+			if (!hasMi && !sid) continue; // panel-bound (mi) or enemy-shot chain (sid)
+			if (out.length >= 32) break;
+			const clean = { ph: (typeof e.ph === 'number' && isFinite(e.ph) && e.ph >= 0 && e.ph <= 3) ? Math.round(e.ph) : 0 };
+			if (hasMi) clean.mi = e.mi;
+			if (sid) clean.sid = sid;
+			if (typeof e.st === 'number' && isFinite(e.st)) clean.st = Math.round(e.st);
+			if (Array.isArray(e.p) && e.p.length === 3
+				&& e.p.every((v) => typeof v === 'number' && isFinite(v) && Math.abs(v) <= 1e6)) clean.p = e.p.map(Math.round);
+			if (Array.isArray(e.v) && e.v.length === 3
+				&& e.v.every((v) => typeof v === 'number' && isFinite(v) && Math.abs(v) <= 1e5)) clean.v = e.v.map(Math.round);
+			out.push(clean);
+		}
+		if (!out.length) return;
+		world.broadcastToInstance(ctx, username, 'bubbleState', { map: data.map, entries: out });
+	});
+
+	// 1.77.x: the host's bubble/disk/coals ran an effect transition — relay it so
+	// every member replays the same native method (and FX) on its puppet.
+	// k: 1=bounce 2=lastSecond 3=steam 4=circularSteam 5=burst 6=turnIce
+	// 7=instantKill 8=iceSlide 9=iceMelt 10=iceBreak 11=coals 12=coalsMelt
+	// 13=hitFx 14=iceConsume.
+	socket.on('bubbleEvent', function (data) {
+		if (dropIfNotAuthed('bubbleEvent')) return;
+		if (rateLimited('bubbleEvent', 30)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96) return;
+		const mi = Number(data.mi);
+		const k = Number(data.k);
+		const sid = (typeof data.sid === 'string' && data.sid.length >= 1 && data.sid.length <= 24 && /^[0-9A-Za-z.:_-]+$/.test(data.sid)) ? data.sid : '';
+		if ((!Number.isInteger(mi) || mi <= 0) && !sid) return; // panel mi OR shot sid
+		if (!Number.isInteger(k) || k < 1 || k > 14) return;
+		const opt = (v) => (typeof v === 'number' && isFinite(v) && Math.abs(v) <= 1e6) ? Math.round(v) : undefined;
+		world.broadcastToInstance(ctx, username, 'bubbleEvent', {
+			map: data.map,
+			mi: Number.isInteger(mi) && mi > 0 ? mi : undefined,
+			sid: sid || undefined,
+			k,
+			x: opt(data.x),
+			y: opt(data.y),
+			z: opt(data.z),
+			vx: opt(data.vx),
+			vy: opt(data.vy),
+			el: opt(data.el),
+			at: opt(data.at),
+		});
+	});
+
+	// 1.77.x: a member's local ball hit its puppet bubble/ice disk — forward the
+	// hit ingredients (element, STEAM/CHARGED hints, hit velocity + point) to the
+	// whole instance; only the host re-judges the transition (tgt 1=bubble 2=disk).
+	socket.on('bubbleHit', function (data) {
+		if (dropIfNotAuthed('bubbleHit')) return;
+		if (rateLimited('bubbleHit', 20)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96) return;
+		const mi = Number(data.mi);
+		const tgt = Number(data.tgt);
+		const sid = (typeof data.sid === 'string' && data.sid.length >= 1 && data.sid.length <= 24 && /^[0-9A-Za-z.:_-]+$/.test(data.sid)) ? data.sid : '';
+		if ((!Number.isInteger(mi) || mi <= 0) && !sid) return; // panel mi OR shot sid
+		if (tgt !== 1 && tgt !== 2) return;
+		const opt = (v) => (typeof v === 'number' && isFinite(v) && Math.abs(v) <= 1e6) ? v : undefined;
+		const el = Number(data.el);
+		world.broadcastToInstance(ctx, username, 'bubbleHit', {
+			from: username,
+			map: data.map,
+			mi: Number.isInteger(mi) && mi > 0 ? mi : undefined,
+			sid: sid || undefined,
+			tgt,
+			el: (Number.isInteger(el) && el >= 0 && el <= 4) ? el : 0,
+			stm: data.stm ? 1 : 0,
+			chg: data.chg ? 1 : 0,
+			vx: opt(data.vx),
+			vy: opt(data.vy),
+			hx: opt(data.hx),
+			hy: opt(data.hy),
+			hz: opt(data.hz),
 		});
 	});
 
