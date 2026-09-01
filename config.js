@@ -119,12 +119,22 @@ const DEFAULTS = {
 	// extension (factor x RTT). Each part disables at 0; both stack.
 	perfectGuardBaseMs: 10,
 	perfectGuardPingFactor: 0.6,
+	// 1.77.x (player trading): master switch + the exchange LOSS ratio. What the
+	// RECEIVER gets = floor(given / tradeRatio) — default 2 means "give 6, the
+	// partner receives 3". 1 = lossless 1:1. Range [1, 1000], fractions allowed
+	// (2.5 -> give 6, receive floor(6/2.5)=2).
+	tradeEnabled: true,
+	tradeRatio: 2,
+	// Anti-dupe lockout: after a save IMPORT (admin) or a MIRROR rollback the
+	// account cannot trade for this many hours (item state was rewound, so
+	// trading would duplicate goods). 0 disables the lockout entirely.
+	tradeLockHours: 48,
 };
 
 // Round 17: mod version. The server rejects any client whose mod version differs
 // (handshake gate in protocol.js). Bump this TOGETHER with the client mod version
 // (client src/multiplayer.ts MP_VERSION + package.json "version") on every release.
-const MOD_VERSION = '2.2.0';
+const MOD_VERSION = '2.3.0';
 
 function loadConfig() {
 	const cfg = Object.assign({}, DEFAULTS);
@@ -178,8 +188,19 @@ function loadConfig() {
 		if (v < 0) return 0;
 		return v > max ? max : v;
 	};
-	cfg.perfectGuardBaseMs = clampNonNeg('perfectGuardBaseMs', DEFAULTS.perfectGuardBaseMs, 5000);
-	cfg.perfectGuardPingFactor = clampNonNeg('perfectGuardPingFactor', DEFAULTS.perfectGuardPingFactor, 10);
+		cfg.perfectGuardBaseMs = clampNonNeg('perfectGuardBaseMs', DEFAULTS.perfectGuardBaseMs, 5000);
+		cfg.perfectGuardPingFactor = clampNonNeg('perfectGuardPingFactor', DEFAULTS.perfectGuardPingFactor, 10);
+		// 1.77.x (trading): strict boolean master switch; ratio clamped to [1, 1000]
+		// (< 1 would CREATE items out of thin air).
+		cfg.tradeEnabled = (cfg.tradeEnabled !== false);
+		{
+			const r = Number(cfg.tradeRatio);
+			cfg.tradeRatio = (isFinite(r) && r >= 1 && r <= 1000) ? r : DEFAULTS.tradeRatio;
+		}
+		{
+			const h = Number(cfg.tradeLockHours);
+			cfg.tradeLockHours = (isFinite(h) && h >= 0 && h <= 8760) ? h : DEFAULTS.tradeLockHours;
+		}
 	// Clamp the save bandwidth caps to a sane finite range [1, 65536] kb/s so a
 	// config typo can't turn the save stream into a firehose or a crawl.
 	const clampKbS = (key, def) => {
@@ -225,6 +246,7 @@ console.log('[config] multiplayer mod v' + config.version +
 		Math.round(config.softDeathReviveHpBoss * 100) + '%' +
 	' | softDeath revive time normal/boss = ' + config.softDeathReviveTimeNormal + 's/' +
 		config.softDeathReviveTimeBoss + 's' +
+	' | trade = ' + (config.tradeEnabled ? ('on, ratio 1:' + config.tradeRatio + ' (receiver gets floor(n/' + config.tradeRatio + '))') : 'off') +
 	' | saveUploadKbS = ' + config.saveUploadKbS +
 	' | saveDownloadKbS = ' + config.saveDownloadKbS +
 	' | playerCollision = ' + config.playerCollision +

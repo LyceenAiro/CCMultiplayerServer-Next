@@ -19,6 +19,10 @@
 	"_perfectGuardComment": "客机精准防御补偿：perfectGuardBaseMs = 基本补偿（毫秒）：怪物攻击命中客机后的该时间内举盾仍算精准防御，期间不受伤害；默认 30，0 = 关闭，不可低于 0。perfectGuardPingFactor = 网络补偿系数：窗口再额外延长 系数 x 客机到主机的往返延迟；默认 0.6，0 = 关闭，不可低于 0。两者叠加。",
 	"perfectGuardBaseMs": 10,
 	"perfectGuardPingFactor": 0.6,
+	"tradeEnabled": true,
+	"tradeRatio": 2,
+	"_tradeLockComment": "tradeLockHours = 防刷物品交易锁定时长（小时）：导入存档或镜像回溯会回滚物品状态，为防刷物品，该账号在此时间内无法交易；按真实时间计算（离线也计时）；默认 48；范围 [0, 8760]；调为 0 则完全关闭该限制。",
+	"tradeLockHours": 48,
 	"_adminComment": "adminToken = 管理界面访问令牌，设为非空字符串即启用 /admin 管理页（空 = 关闭，安全默认）。adminTeleports = 调试面板的传送点预设列表：[{label, map, marker?}]，marker 可省略（落在地图默认出生点）。",
 	"adminToken": "admin123",
 	"adminTeleports": [

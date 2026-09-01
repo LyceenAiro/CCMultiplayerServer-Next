@@ -25,6 +25,25 @@ const AREA_TOWN = 0;
 //   homestedt     = 家园 (Homestedt)
 const SHARED_TOWNS = ['rookie-harbor', 'rhombus-sqr', 'bergen', 'ba-ki-kum', 'basin-keep', 'homestedt'];
 
+// Solo-only zones: the Bergen monastery trial caves (升灵/进步/升华挑战, quests
+// monks-1/2/3-jump_challenge* + monks-jump_*). These trials are single-player
+// by design (modifiers stripped, player sealed in). Without this pin a party
+// MEMBER entering a cave joins the shared bergen town channel whose host is
+// elsewhere: the member strips its local enemies on load and nobody streams
+// replacements — the cave stays EMPTY (the "trial spawns no monsters" bug).
+// Routing every entrant to a per-player solo instance makes them host their
+// own copy (live enemies) and keeps anyone else from matchmaking in.
+const SOLO_ZONES = {
+	'bergen.special.monks-questcave1': true,
+	'bergen.special.monks-questcave2': true,
+	'bergen.special.monks-questcave3': true,
+};
+
+/** True when the map (dot-name) is a solo-only zone. */
+function isSoloZoneMap(mapName) {
+	return typeof mapName === 'string' && SOLO_ZONES[mapName] === true;
+}
+
 // Max players in one main-city instance (channel). A full channel forces the next
 // joiner into a new `town:<area>#N` channel (like MMO channels).
 const TOWN_CAPACITY = 32;
@@ -64,6 +83,11 @@ World.prototype.instanceIdFor = function (username, mapName, areaType, ctx) {
 	// if they're in a party (so a duel can't be yanked back into a group by a
 	// party accept/kick/leave or by wandering through a shared-town map).
 	if (this.userIsolation[username]) {
+		return 'solo:' + username + ':' + mapName;
+	}
+	// Solo-only zones override every routing rule (town/party): every entrant
+	// hosts their own copy of the map; matchmaking into it is impossible.
+	if (isSoloZoneMap(mapName)) {
 		return 'solo:' + username + ':' + mapName;
 	}
 	const townArea = sharedTownArea(mapName, areaType);
@@ -137,6 +161,11 @@ World.prototype.instanceIdFor = function (username, mapName, areaType, ctx) {
 
 World.prototype.instanceOf = function (username) {
 	return this.userInstance[username];
+};
+
+// Solo-only zone predicate for protocol.js (regroup refusal etc.).
+World.prototype.isSoloZoneMap = function (mapName) {
+	return isSoloZoneMap(mapName);
 };
 
 // The usernames in the instance the given player is currently in (empty array if

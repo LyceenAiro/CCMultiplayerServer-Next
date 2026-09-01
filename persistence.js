@@ -161,6 +161,62 @@ Persistence.prototype.setMainSave = function (username, data) {
 	}
 };
 
+// 1.77.x (trade anti-dupe): a per-account trade lockout timestamp (epoch ms).
+// It lives in the per-user save file so it survives restarts and follows the
+// same atomic-write story; setMainSave deliberately never touches it. Set when
+// a save is IMPORTED over the account or a MIRROR is rolled back — either one
+// rewinds item state, so trading stays blocked for config.tradeLockHours.
+Persistence.prototype.getTradeLock = function (username) {
+	const game = this.loadGame(username);
+	const until = game && Number(game.tradeLockedUntil);
+	return (isFinite(until) && until > 0) ? until : 0;
+};
+
+// Clear the trade lockout entirely (admin web button). Same atomic-write story
+// as lockTrade; a missing/0 lock is a cheap no-op. If the account is ONLINE the
+// caller must ALSO push the clear to that client (its local deadline gate).
+Persistence.prototype.clearTradeLock = function (username) {
+	const file = saveFileFor(username);
+	let existing = {};
+	try {
+		if (fs.existsSync(file)) existing = JSON.parse(fs.readFileSync(file, 'utf8'));
+	} catch (e) { /* overwrite */ }
+	if (!existing || typeof existing !== 'object') existing = {};
+	if (!(Number(existing.tradeLockedUntil) > 0)) return true; // nothing to clear
+	existing.tradeLockedUntil = 0;
+	try {
+		const tmp = file + '.tmp';
+		fs.writeFileSync(tmp, JSON.stringify(existing, null, '\t'));
+		fs.renameSync(tmp, file);
+		return true;
+	} catch (e) {
+		console.error('[persistence] clearTradeLock failed for ' + username + ':', e.message);
+		return false;
+	}
+};
+
+// Lock trading for durationMs from NOW. Never shortens a longer existing lock.
+Persistence.prototype.lockTrade = function (username, durationMs) {
+	const file = saveFileFor(username);
+	let existing = {};
+	try {
+		if (fs.existsSync(file)) existing = JSON.parse(fs.readFileSync(file, 'utf8'));
+	} catch (e) { /* overwrite */ }
+	if (!existing || typeof existing !== 'object') existing = {};
+	const until = Date.now() + Math.max(0, Number(durationMs) || 0);
+	if (Number(existing.tradeLockedUntil) > until) return true; // keep the longer lock
+	existing.tradeLockedUntil = until;
+	try {
+		const tmp = file + '.tmp';
+		fs.writeFileSync(tmp, JSON.stringify(existing, null, '\t'));
+		fs.renameSync(tmp, file);
+		return true;
+	} catch (e) {
+		console.error('[persistence] lockTrade failed for ' + username + ':', e.message);
+		return false;
+	}
+};
+
 // 1.71.0: metadata only (newest first) for the client's rollback picker. The raw
 // mirror data stays on disk until loadSaveMirror asks for one entry.
 Persistence.prototype.listSaveMirrors = function (username) {

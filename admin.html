@@ -255,6 +255,7 @@ var itemdb = [];
 var teleports = [];
 var pickedItem = null;
 var godState = {}; // 玩家名 -> 无敌模式最后已知状态（本页内存，仅会话）
+var tradeLockHours = 48; // 服务器配置的交易锁定时长（/players 下发，0 = 限制已关闭）
 
 async function api(path, opts) {
   opts = opts || {};
@@ -283,12 +284,24 @@ function fmtPlaytime(s) {
   if (!s) return '0 小时 0 分';
   return Math.floor(s / 3600) + ' 小时 ' + Math.floor((s % 3600) / 60) + ' 分';
 }
+// 交易锁定剩余时间：'47 小时 23 分' / '58 分钟'
+function fmtLockRemain(ms) {
+  var totalMin = Math.ceil(ms / 60000);
+  var h = Math.floor(totalMin / 60), m = totalMin % 60;
+  if (h <= 0) return m + ' 分钟';
+  return m > 0 ? (h + ' 小时 ' + m + ' 分') : (h + ' 小时');
+}
+function lockRemainMs(p) {
+  var u = Number(p && p.tradeLockUntil) || 0;
+  return u > Date.now() ? (u - Date.now()) : 0;
+}
 function esc(s) { return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 
 async function refreshAll() {
   try {
     var j = await api('/players');
     players = j.players || [];
+    if (typeof j.tradeLockHours === 'number') tradeLockHours = j.tradeLockHours;
     sortPlayers();
     renderList();
     if (current) await loadDetail(encodeURIComponent(current));
@@ -323,9 +336,13 @@ function renderListInner() {
   }
   if (!shown.length) { el.innerHTML = '<div class="dim">' + (q ? '无匹配玩家' : '暂无玩家') + '</div>'; return; }
   el.innerHTML = shown.map(function(p){
+    var lm = lockRemainMs(p);
+    var lockHtml = lm > 0
+      ? ' <span style="color:var(--bad)">🔒 交易锁定 剩 ' + fmtLockRemain(lm) + '</span>'
+      : '';
     return '<div class="player' + (p.name === current ? ' sel' : '') + '" onclick="loadDetail(\'' + encodeURIComponent(p.name) + '\')">' +
       '<div class="nm">' + esc(p.name) + ' <span class="badge ' + (p.online ? 'on' : 'off') + '">' + (p.online ? '在线' : '离线') + '</span></div>' +
-      '<div class="sub">存档更新：' + fmtTime(p.updatedAt) + '</div></div>';
+      '<div class="sub">存档更新：' + fmtTime(p.updatedAt) + lockHtml + '</div></div>';
   }).join('');
 }
 
@@ -343,7 +360,8 @@ function sortPlayers() {
 }
 // 列表内容指纹：内容没变就不重建 DOM，避免闪烁/打断
 function listKey() {
-  return players.map(function(p){ return p.name + (p.online ? '1' : '0') + (p.updatedAt || ''); }).join('|');
+  // 锁定时长按小时粒度入指纹：到期/新锁定会触发重绘，分钟级流逝不打断浏览
+  return players.map(function(p){ return p.name + (p.online ? '1' : '0') + (p.updatedAt || '') + (lockRemainMs(p) > 0 ? 'L' + Math.ceil(lockRemainMs(p) / 3600000) : ''); }).join('|');
 }
 // 仅就地更新详情页头部的在线徽章（不重绘详情，不影响正在输入的内容）
 function updateDetailBadge() {
@@ -365,6 +383,7 @@ async function pollPlayers() {
     var j = await api('/players', { quiet: true });
     var before = listKey();
     players = j.players || [];
+    if (typeof j.tradeLockHours === 'number') tradeLockHours = j.tradeLockHours;
     sortPlayers();
     if (listKey() !== before) { renderList(); updateDetailBadge(); }
   } catch (e) { /* 轮询静默失败，绝不打断当前操作 */ }
@@ -393,6 +412,18 @@ function renderDetail() {
   var d = detail, s = d.save, p = (s && s.player) || {};
   var html = '<div id="msg"></div>';
   html += '<h2>' + esc(d.name) + ' <span class="badge ' + (d.online ? 'on' : 'off') + '">' + (d.online ? '在线' : '离线') + '</span></h2>';
+  // 交易锁定状态（防刷物品限制）：锁定中显示剩余时间与到期时刻，并附服务器配置时长
+  var lu = Number(d.tradeLockUntil) || 0;
+  var cfgH = (typeof d.tradeLockHours === 'number' && isFinite(d.tradeLockHours) && d.tradeLockHours >= 0) ? d.tradeLockHours : tradeLockHours;
+  var lockTxt;
+  if (lu > Date.now()) {
+    lockTxt = '<span style="color:var(--bad)">🔒 锁定中 — 剩余约 ' + fmtLockRemain(lu - Date.now()) + '（至 ' + fmtTime(new Date(lu)) + '）</span>';
+  } else {
+    lockTxt = '<span style="color:var(--ok)">未锁定</span>';
+  }
+  lockTxt += ' <span class="dim">（配置时长：' + (cfgH > 0 ? (cfgH + ' 小时，0 = 关闭') : '已关闭') + '）</span>';
+  if (lu > Date.now()) lockTxt += ' <button class="ghost" style="margin-left:8px" onclick="clearTradeLock()">解除锁定</button>';
+  html += '<div style="margin:2px 0 10px">交易锁定：' + lockTxt + '</div>';
   if (!s) html += '<div class="dim">该玩家还没有主存档</div>';
   else if (s.corrupt) html += '<div class="dim">主存档无法解析（可能损坏）</div>';
   else {
@@ -443,6 +474,14 @@ async function switchMirror(i) {
   if (!confirm('确定将主存档切换为镜像 #' + i + '？\n当前主存档不会自动备份进镜像列表。')) return;
   var j = await api('/player/' + encodeURIComponent(current) + '/switchMirror', { method: 'POST', body: { index: i } });
   showMsg(j.ok, j.msg);
+  if (j.ok) loadDetail(encodeURIComponent(current));
+}
+// 解除当前玩家的交易锁定（服务器存档死线为权威；在线玩家会被实时推送解除）
+async function clearTradeLock() {
+  if (!current) return;
+  if (!confirm('确定解除玩家「' + current + '」的交易锁定？\n解除后其可立即交易。')) return;
+  var j = await api('/player/' + encodeURIComponent(current) + '/clearTradeLock', { method: 'POST' });
+  showMsg(j.ok, j.msg || (j.ok ? '交易锁定已解除' : '操作失败'));
   if (j.ok) loadDetail(encodeURIComponent(current));
 }
 function exportSave() {

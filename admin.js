@@ -16,6 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const accounts = require('./accounts');
+const config = require('./config');
 const persistence = require('./persistence');
 const savecodec = require('./savecodec');
 const itemdb = require('./itemdb');
@@ -163,14 +164,19 @@ function createRouter(config) {
 			if (bots.isBotName(name)) continue;
 			const a = db.accounts[name];
 			let updatedAt = null;
+			let tradeLockUntil = 0;
 			try {
 				const g = persistence.loadGame(name);
 				if (g && typeof g.updatedAt === 'string') updatedAt = g.updatedAt;
+				// Anti-dupe trade lockout deadline (epoch ms, 0 = not locked) — from
+				// the same save object loadGame just read; no extra IO.
+				const u = g && Number(g.tradeLockedUntil);
+				if (isFinite(u) && u > 0) tradeLockUntil = u;
 			} catch (e) { /* ignore */ }
-			out.push({ name, online: accounts.isOnline(name), lastSeen: a.lastSeen || null, createdAt: a.createdAt || null, updatedAt });
+			out.push({ name, online: accounts.isOnline(name), lastSeen: a.lastSeen || null, createdAt: a.createdAt || null, updatedAt, tradeLockUntil });
 		}
 		out.sort((x, y) => (y.online - x.online) || String(x.name).localeCompare(String(y.name)));
-		res.json({ ok: true, players: out });
+		res.json({ ok: true, players: out, tradeLockHours: config.tradeLockHours });
 	});
 
 	// one player's save detail
@@ -183,6 +189,10 @@ function createRouter(config) {
 			ok: true, name, online: accounts.isOnline(name),
 			save,
 			mirrors: persistence.listSaveMirrors(name),
+			// Anti-dupe trade lockout: deadline (epoch ms, 0 = not locked) + the
+			// configured duration, so the page can show both.
+			tradeLockUntil: persistence.getTradeLock(name),
+			tradeLockHours: config.tradeLockHours,
 		});
 	});
 
@@ -197,8 +207,10 @@ function createRouter(config) {
 			return res.status(404).json({ ok: false, msg: '镜像不存在或已损坏' });
 		}
 		if (!persistence.setMainSave(name, data)) return res.status(500).json({ ok: false, msg: '写入失败' });
+		// Anti-dupe: rolling back to a mirror rewinds item state -> trade lockout.
+		if (config.tradeLockHours > 0) persistence.lockTrade(name, config.tradeLockHours * 3600000);
 		const online = accounts.isOnline(name);
-		res.json({ ok: true, msg: online ? '已切换；该玩家在线，将在其下次登录时生效（或强制下线后立即生效）' : '已切换为指定镜像' });
+		res.json({ ok: true, msg: (online ? '已切换；该玩家在线，将在其下次登录时生效（或强制下线后立即生效）' : '已切换为指定镜像') + (config.tradeLockHours > 0 ? '；交易功能已锁定 ' + config.tradeLockHours + ' 小时' : '') });
 	});
 
 	// export MAIN save only
@@ -224,8 +236,10 @@ function createRouter(config) {
 			return res.status(400).json({ ok: false, msg: '存档内容无效（不是可识别的游戏存档）' });
 		}
 		if (!persistence.setMainSave(name, raw)) return res.status(500).json({ ok: false, msg: '写入失败' });
+		// Anti-dupe: importing a save rewinds item state -> trade lockout.
+		if (config.tradeLockHours > 0) persistence.lockTrade(name, config.tradeLockHours * 3600000);
 		const online = accounts.isOnline(name);
-		res.json({ ok: true, msg: online ? '已导入主存档（镜像未动）；该玩家在线，将在其下次登录时生效' : '已导入主存档（镜像未动）' });
+		res.json({ ok: true, msg: (online ? '已导入主存档（镜像未动）；该玩家在线，将在其下次登录时生效' : '已导入主存档（镜像未动）') + (config.tradeLockHours > 0 ? '；交易功能已锁定 ' + config.tradeLockHours + ' 小时' : '') });
 	});
 
 	// rename
@@ -234,6 +248,21 @@ function createRouter(config) {
 		const newName = req.body && typeof req.body.newName === 'string' ? req.body.newName.trim() : '';
 		if (!accounts.exists(name)) return res.status(404).json({ ok: false, msg: '玩家不存在' });
 		res.json(renamePlayer(name, newName));
+	});
+
+	// clear the anti-dupe trade lockout (admin override). Clears the save-file
+	// deadline (authoritative); when the player is ONLINE we also push a live
+	// clearTradeLock command so their local trade gate opens without re-login.
+	router.post('/api/player/:name/clearTradeLock', async (req, res) => {
+		const name = req.params.name;
+		if (!accounts.exists(name) || bots.isBotName(name)) return res.status(404).json({ ok: false, msg: '玩家不存在' });
+		if (!persistence.clearTradeLock(name)) return res.status(500).json({ ok: false, msg: '写入失败' });
+		let msg = '交易锁定已解除';
+		if (accounts.isOnline(name)) {
+			const ack = await sendCommand(name, { kind: 'clearTradeLock' });
+			msg += ack.ok ? '（在线玩家已实时生效）' : '（在线玩家本地未确认：' + ack.msg + '；最迟其下次登录时生效）';
+		}
+		res.json({ ok: true, msg, tradeLockUntil: persistence.getTradeLock(name) });
 	});
 
 	// ---- debug commands (require online) ----

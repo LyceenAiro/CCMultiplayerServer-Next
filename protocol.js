@@ -55,6 +55,63 @@ function crossDespawnDifferentInstances(affected) {
 const storyStartRequests = Object.create(null);
 let storyReqSeq = 1;
 
+// ---- 1.77.x: player-to-player trading (normal materials + food, loss ratio) ----
+// The server is the BROKER: it owns the session state machine (offers / ready
+// flags), computes the authoritative EFFECTIVE lists (the RECEIVER gets
+// floor(given / tradeRatio) — default 2 = "give 6, partner receives 3") and sends
+// each side its own {lose, gain} with tradeApply. Both clients then apply to
+// their OWN inventory and ack. A trade can never be atomic across two separate
+// saves, so every completed trade is kept in a ring buffer for manual restore.
+const tradeSessions = new Map(); // sid -> {a, b, offer:{a:[],b:[]}, ready:{a:0,b:0}, ack:{a:0,b:0}, applying:0, at}
+let tradeSidSeq = 1;
+const tradeLog = []; // last 200 completed trades: {at, a, b, loseA, gainA, ratio}
+
+function tradeValidateItems(raw) {
+	if (!Array.isArray(raw) || raw.length === 0 || raw.length > 16) return null;
+	const seen = Object.create(null);
+	const out = [];
+	for (let i = 0; i < raw.length; i++) {
+		const e = raw[i];
+		if (!e || typeof e !== 'object') return null;
+		const id = typeof e.id === 'string' ? e.id.slice(0, 48) : '';
+		if (!/^[\w\-]{1,48}$/.test(id)) return null;
+		const n = Number(e.n);
+		if (!Number.isInteger(n) || n < 1 || n > 99) return null;
+		if (seen[id]) return null; // one row per item id
+		seen[id] = 1;
+		out.push({ id, n });
+	}
+	return out;
+}
+
+function tradeSend(ctxObj, name, event, payload) {
+	try {
+		const sock = ctxObj.getSocket(name);
+		if (sock) sock.emit(event, payload);
+	} catch (e) { /* the socket may already be gone */ }
+}
+
+function tradeCloseSession(ctxObj, sid, reason) {
+	const s = tradeSessions.get(sid);
+	if (!s) return;
+	tradeSessions.delete(sid);
+	tradeSend(ctxObj, s.a, 'tradeClosed', { sid, reason: String(reason || '').slice(0, 64) });
+	tradeSend(ctxObj, s.b, 'tradeClosed', { sid, reason: String(reason || '').slice(0, 64) });
+}
+
+function tradeCloseSessionsFor(ctxObj, name) {
+	for (const sid of Array.from(tradeSessions.keys())) {
+		const s = tradeSessions.get(sid);
+		if (s && (s.a === name || s.b === name)) tradeCloseSession(ctxObj, sid, 'disconnect');
+	}
+}
+
+/** The authoritative exchange: what the RECEIVER ends up with for a raw offer. */
+function tradeEffective(items, ratio) {
+	return items.map((e) => ({ id: e.id, n: Math.floor(e.n / ratio) }));
+}
+
+
 function handleConnection(socket) {
 	// username is set once the socket has logged in (handshake).
 	let username = null;
@@ -577,6 +634,16 @@ function handleConnection(socket) {
 			// no damage while that window is open. Each part disables at 0.
 			perfectGuardBaseMs: config.perfectGuardBaseMs,
 			perfectGuardPingFactor: config.perfectGuardPingFactor,
+			// 1.77.x (player trading): master switch + the exchange LOSS ratio
+			// (receiver gets floor(n / ratio); 2 = "give 6, receive 3").
+			tradeEnabled: config.tradeEnabled,
+			tradeRatio: config.tradeRatio,
+			// Anti-dupe: remaining trade lockout in ms (0 = free to trade). Set by
+			// save import / mirror rollback; the client computes its own deadline.
+			tradeLockMs: Math.max(0, persistence.getTradeLock(name) - Date.now()),
+			// ...plus the CONFIGURED lock duration so client-side messages can name
+			// the real number instead of a hardcoded "48 小时".
+			tradeLockHours: config.tradeLockHours,
 			// Round 17: the accepted server version (harmless; useful for logs — the
 			// client already sent its own version in the handshake payload).
 			version: config.version,
@@ -626,6 +693,8 @@ function handleConnection(socket) {
 	function doLogout() {
 		const name = username;
 		username = null;
+		// 1.77.x (trading): close any live trade session (tells the partner).
+		tradeCloseSessionsFor(ctx, name);
 		// Leaving the party on logout keeps party state clean for LAN sessions.
 		const partyId = party.partyOf(name);
 		const survivors = partyId && party.getParty(partyId) ? party.getParty(partyId).members.filter((m) => m !== name) : [];
@@ -1138,6 +1207,8 @@ function handleConnection(socket) {
 	//   ball       { pl, t: 'b'|'w'|'a', i: ball uid, x/y/z, ang? } — replay
 	//              ballBounce / ballWallKill / ballAirKill on the receiver's
 	//              puppet at the thrower's exact impact point + wall angle.
+	//   wblock     { pl, m: mapId, s: 'steam'|'melt'|'ice'|'bounce'|'bump' } —
+	//              1.77.x WaterBlock (冰柱) transition replay on the receiver's copy.
 	socket.on('puzzleFx', function (data) {
 		if (dropIfNotAuthed('puzzleFx')) return;
 		if (rateLimited('puzzleFx', 40)) return;
@@ -1156,6 +1227,17 @@ function handleConnection(socket) {
 			const g = typeof data.g === 'string' ? data.g.slice(0, 32) : '';
 			if (!/^[\w.\-]{1,32}$/.test(g)) return;
 			world.broadcastToInstance(ctx, username, 'puzzleFx', { pl, k: 'poleCancel', g });
+			return;
+		}
+		if (data.k === 'wblock') {
+			// 1.77.x (WaterBlock sync): a teammate steamed / melted / froze /
+			// bounced / bumped a water block (冰柱) — receivers replay the same
+			// transition FX on their own copy (steam replays FX-only, no force).
+			const m = Number(data.m);
+			if (!Number.isInteger(m) || m < 0 || m > 1e9) return;
+			const s = data.s;
+			if (s !== 'steam' && s !== 'melt' && s !== 'ice' && s !== 'bounce' && s !== 'bump') return;
+			world.broadcastToInstance(ctx, username, 'puzzleFx', { pl, k: 'wblock', m, s });
 			return;
 		}
 		if (data.k === 'ball') {
@@ -1772,7 +1854,210 @@ function handleConnection(socket) {
 		if (rateLimited('plantBreak', 20)) return;
 		if (!data || typeof data.mapId !== 'number' || !Number.isInteger(data.mapId) || data.mapId <= 0) return;
 		if (typeof data.map !== 'string' || data.map.length === 0 || data.map.length > 128) return;
-		world.broadcastToInstance(ctx, username, 'plantBreak', { map: data.map, mapId: data.mapId });
+		// 1.76.x (plant-bug adoption): the breaker's pre-rolled enemy outcome — the
+		// HOST spawns the authoritative dynamic enemy from it. Whitelist type (an
+		// enemyInfo type path) + optional rank.
+		let es;
+		if (data.es && typeof data.es === 'object') {
+			const t = typeof data.es.t === 'string' ? data.es.t.slice(0, 64) : '';
+			if (/^[\w\-./]{1,64}$/.test(t)) {
+				es = { t };
+				const rk = Number(data.es.rk);
+				if (isFinite(rk) && rk >= 0 && rk <= 100) es.rk = Math.round(rk * 10) / 10;
+			}
+		}
+		const out = { map: data.map, mapId: data.mapId };
+		if (es) out.es = es;
+		world.broadcastToInstance(ctx, username, 'plantBreak', out);
+	});
+
+	// ---- 1.77.x: player-to-player trading (see the module-level trade block) ----
+	// merchant presence: broadcast so every same-instance client draws the trader
+	// icon over that player's mirror and can click/interact to invite.
+	socket.on('tradeMerchant', function (data) {
+		if (dropIfNotAuthed('tradeMerchant')) return;
+		if (rateLimited('tradeMerchant', 5)) return;
+		if (!config.tradeEnabled) return;
+		// Anti-dupe: a trade-locked account cannot advertise merchant mode.
+		if (persistence.getTradeLock(username) > Date.now()) return;
+		world.broadcastToInstance(ctx, username, 'tradeMerchant', { pl: username, on: data === true || data === 1 || (data && data.on) === true });
+	});
+
+	// trade invite: clicking a merchant opens the session RIGHT AWAY (1.77.x
+	// no-accept trade). The server brokers it and tells BOTH sides with
+	// tradeOpen — neither side confirms an invite anymore. Silently dropped
+	// when either side is already trading.
+	socket.on('tradeInvite', function (data) {
+		if (dropIfNotAuthed('tradeInvite')) return;
+		if (rateLimited('tradeInvite', 2)) return;
+		if (!config.tradeEnabled) return;
+		const to = (data && typeof data.to === 'string') ? data.to.slice(0, 32) : '';
+		if (!isValidName(to) || to === username) return;
+		if (!ctx.getSocket(to)) return; // not online / not connected
+		// Anti-dupe: refuse when EITHER side is trade-locked, and tell the inviter
+		// which side + how long remains so the client can show a real message.
+		{
+			const nowMs = Date.now();
+			const lockSelf = persistence.getTradeLock(username);
+			const lockPeer = persistence.getTradeLock(to);
+			if (lockSelf > nowMs || lockPeer > nowMs) {
+				socket.emit('tradeRejected', {
+					reason: 'locked',
+					self: lockSelf > nowMs,
+					name: lockSelf > nowMs ? username : to,
+					lockMs: Math.max(lockSelf, lockPeer) - nowMs,
+				});
+				return;
+			}
+		}
+		for (const s of tradeSessions.values()) {
+			if (s.a === username || s.b === username || s.a === to || s.b === to) return;
+		}
+		const sid = tradeSidSeq++;
+		tradeSessions.set(sid, {
+			sid, a: username, b: to,
+			offer: { a: [], b: [] },
+			ready: { a: 0, b: 0 },
+			ack: { a: 0, b: 0 },
+			applying: 0,
+			at: Date.now(),
+		});
+		const open = { sid, a: username, b: to, ratio: config.tradeRatio };
+		tradeSend(ctx, username, 'tradeOpen', open);
+		tradeSend(ctx, to, 'tradeOpen', open);
+		console.log('[trade] session ' + sid + ' opened (no-accept): ' + username + ' <-> ' + to + ' (ratio 1:' + config.tradeRatio + ')');
+	});
+
+	// accept an invite -> the server opens the session and tells BOTH sides.
+	socket.on('tradeAccept', function (data) {
+		if (dropIfNotAuthed('tradeAccept')) return;
+		if (rateLimited('tradeAccept', 2)) return;
+		if (!config.tradeEnabled) return;
+		const from = (data && typeof data.from === 'string') ? data.from.slice(0, 32) : '';
+		if (!isValidName(from) || from === username) return;
+		if (!ctx.getSocket(from)) return;
+		// Anti-dupe: same lockout guard as tradeInvite (either side locked).
+		{
+			const nowMs = Date.now();
+			const lockSelf = persistence.getTradeLock(username);
+			const lockPeer = persistence.getTradeLock(from);
+			if (lockSelf > nowMs || lockPeer > nowMs) {
+				socket.emit('tradeRejected', {
+					reason: 'locked',
+					self: lockSelf > nowMs,
+					name: lockSelf > nowMs ? username : from,
+					lockMs: Math.max(lockSelf, lockPeer) - nowMs,
+				});
+				return;
+			}
+		}
+		// one live session per player: close any stale one first.
+		tradeCloseSessionsFor(ctx, username);
+		tradeCloseSessionsFor(ctx, from);
+		const sid = tradeSidSeq++;
+		tradeSessions.set(sid, {
+			sid, a: from, b: username,
+			offer: { a: [], b: [] },
+			ready: { a: 0, b: 0 },
+			ack: { a: 0, b: 0 },
+			applying: 0,
+			at: Date.now(),
+		});
+		const open = { sid, a: from, b: username, ratio: config.tradeRatio };
+		tradeSend(ctx, from, 'tradeOpen', open);
+		tradeSend(ctx, username, 'tradeOpen', open);
+		console.log('[trade] session ' + sid + ' opened: ' + from + ' <-> ' + username + ' (ratio 1:' + config.tradeRatio + ')');
+	});
+
+	// the receiver-obtained-once whitelist: what THIS player has ever obtained
+	// (tradeable categories, filtered client-side); the partner needs it to know
+	// which items they may offer TO me.
+	socket.on('tradeKnown', function (data) {
+		if (dropIfNotAuthed('tradeKnown')) return;
+		if (rateLimited('tradeKnown', 2)) return;
+		const s = data && tradeSessions.get(Number(data.sid));
+		if (!s || (s.a !== username && s.b !== username)) return;
+		let ids = [];
+		if (Array.isArray(data.ids)) {
+			for (let i = 0; i < data.ids.length && i < 512; i++) {
+				const id = typeof data.ids[i] === 'string' ? data.ids[i].slice(0, 48) : '';
+				if (/^[\w\-]{1,48}$/.test(id)) ids.push(id);
+			}
+		}
+		ids = Array.from(new Set(ids));
+		const other = s.a === username ? s.b : s.a;
+		tradeSend(ctx, other, 'tradeKnown', { sid: s.sid, from: username, ids });
+	});
+
+	// update one side's offer. Any change un-readies BOTH sides (anti-scam).
+	socket.on('tradeOffer', function (data) {
+		if (dropIfNotAuthed('tradeOffer')) return;
+		if (rateLimited('tradeOffer', 10)) return;
+		if (!config.tradeEnabled) return;
+		const sid = Number(data && data.sid);
+		const s = tradeSessions.get(sid);
+		if (!s || s.applying) return;
+		const side = s.a === username ? 'a' : (s.b === username ? 'b' : null);
+		if (!side) return;
+		const items = tradeValidateItems(data && data.items);
+		if (!items) return;
+		s.offer[side] = items;
+		s.ready.a = 0; s.ready.b = 0;
+		const state = { sid, side, items, readyA: 0, readyB: 0 };
+		tradeSend(ctx, s.a, 'tradeState', state);
+		tradeSend(ctx, s.b, 'tradeState', state);
+	});
+
+	socket.on('tradeReady', function (data) {
+		if (dropIfNotAuthed('tradeReady')) return;
+		if (rateLimited('tradeReady', 5)) return;
+		if (!config.tradeEnabled) return;
+		const sid = Number(data && data.sid);
+		const s = tradeSessions.get(sid);
+		if (!s || s.applying) return;
+		const side = s.a === username ? 'a' : (s.b === username ? 'b' : null);
+		if (!side) return;
+		s.ready[side] = (data.on === true || data.on === 1) ? 1 : 0;
+		const state = { sid, side, readyA: s.ready.a, readyB: s.ready.b };
+		tradeSend(ctx, s.a, 'tradeState', state);
+		tradeSend(ctx, s.b, 'tradeState', state);
+		// both locked -> compute the AUTHORITATIVE effective exchange and dispatch.
+		if (s.ready.a && s.ready.b) {
+			const ratio = config.tradeRatio;
+			s.applying = 1;
+			tradeSend(ctx, s.a, 'tradeApply', { sid, lose: s.offer.a, gain: tradeEffective(s.offer.b, ratio) });
+			tradeSend(ctx, s.b, 'tradeApply', { sid, lose: s.offer.b, gain: tradeEffective(s.offer.a, ratio) });
+			console.log('[trade] session ' + sid + ' dispatched for apply (ratio 1:' + ratio + ')');
+		}
+	});
+
+	socket.on('tradeApplied', function (data) {
+		if (dropIfNotAuthed('tradeApplied')) return;
+		const sid = Number(data && data.sid);
+		const s = tradeSessions.get(sid);
+		if (!s || !s.applying) return;
+		const side = s.a === username ? 'a' : (s.b === username ? 'b' : null);
+		if (!side) return;
+		s.ack[side] = 1;
+		if (s.ack.a && s.ack.b) {
+			tradeLog.push({ at: new Date().toISOString(), a: s.a, b: s.b, loseA: s.offer.a, gainA: tradeEffective(s.offer.b, config.tradeRatio), ratio: config.tradeRatio });
+			if (tradeLog.length > 200) tradeLog.shift();
+			tradeSend(ctx, s.a, 'tradeDone', { sid });
+			tradeSend(ctx, s.b, 'tradeDone', { sid });
+			tradeSessions.delete(sid);
+			console.log('[trade] session ' + sid + ' completed');
+		}
+	});
+
+	socket.on('tradeCancel', function (data) {
+		if (dropIfNotAuthed('tradeCancel')) return;
+		if (rateLimited('tradeCancel', 5)) return;
+		const sid = Number(data && data.sid);
+		const s = tradeSessions.get(sid);
+		if (!s) return;
+		if (s.a !== username && s.b !== username) return;
+		const reason = (data && typeof data.reason === 'string') ? data.reason : 'cancel';
+		tradeCloseSession(ctx, sid, reason);
 	});
 
 	// ---- ROUND 141: prop hit-FX sync ----
@@ -1837,7 +2122,13 @@ function handleConnection(socket) {
 	// and `pl`/`dl` relay PushPullDest plate state so a box sinks with its plate.
 	socket.on('puzzleState', function (data) {
 		if (dropIfNotAuthed('puzzleState')) return;
-		if (rateLimited('puzzleState', 20)) return;
+		// 1.77.x: 20/s was below the 30Hz fast stream (moving boxes/ice pillars, and
+		// now the host-managed heat-dng.f1.room-02 lorries). The fixed 1s window then
+		// passed the first ~20 packets and DROPPED the rest each second — a visible
+		// "smooth for ~0.7s, then a stall every second" pattern on platforms. 60/s
+		// covers 30Hz fast + 1Hz fulls + switch traffic with headroom; packets are
+		// tiny and every field is whitelisted below, so the flood risk is unchanged.
+		if (rateLimited('puzzleState', 60)) return;
 		if (!data || typeof data.map !== 'string' || data.map.length > 96 || !Array.isArray(data.entries)) return;
 		const out = [];
 		for (const e of data.entries) {
@@ -3234,6 +3525,13 @@ function handleConnection(socket) {
 			return;
 		}
 		const loc = world.getMemberLocation(target);
+		// Solo-only zones (monastery trial caves): the target is inside a
+		// single-player trial. Refuse with a reason — a regroup there would
+		// route the requester into their OWN empty copy of the zone anyway.
+		if (loc && loc.map && world.isSoloZoneMap(loc.map)) {
+			socket.emit('partyMove', { leader: target, blocked: 'soloZone' });
+			return;
+		}
 		// Only send a regroup when we actually know where the target is;
 		// otherwise the requester would get a null map and teleport nowhere.
 		if (loc && loc.map) {
@@ -3525,9 +3823,18 @@ function handleConnection(socket) {
 			socket.emit('saveMirrorRestoreResult', { ok: false, reason: index < 0 ? 'noSave' : 'notFound' });
 			return;
 		}
-		socket.emit('saveMirrorRestoreResult', { ok: true, index });
+		// Anti-dupe: a real rollback (index >= 0, not the -1 latest-save fallback)
+		// rewinds item state — lock trading for config.tradeLockHours and tell the
+		// client the remaining lock in the same result payload.
+		if (index >= 0 && config.tradeLockHours > 0) {
+			persistence.lockTrade(username, config.tradeLockHours * 3600000);
+		}
+		socket.emit('saveMirrorRestoreResult', {
+			ok: true, index,
+			tradeLockMs: Math.max(0, persistence.getTradeLock(username) - Date.now()),
+		});
 		streamSaveDownload(raw);
-		console.log('[protocol] ' + username + ' restoring save mirror index=' + index + ' bytes=' + raw.length);
+		console.log('[protocol] ' + username + ' restoring save mirror index=' + index + ' bytes=' + raw.length + (index >= 0 ? ' (trade locked)' : ''));
 	});
 
 	// ---- server-side save ----
