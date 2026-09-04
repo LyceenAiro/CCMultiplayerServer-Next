@@ -217,6 +217,60 @@ Persistence.prototype.lockTrade = function (username, durationMs) {
 	}
 };
 
+// 1.78.x (login passwords): the account password hash lives in the per-user
+// save file as the top-level "password" field — same atomic-write story as
+// tradeLockedUntil. saveGame/setMainSave/mirrors never touch it, save EXPORT
+// never includes it (export copies only autoSlot). Only a salted scrypt hash is
+// stored (see auth.js), so not even the server admin can recover the plaintext.
+Persistence.prototype.getPassword = function (username) {
+	const game = this.loadGame(username);
+	const p = game && game.password;
+	return (p && p.algo === 'scrypt' && typeof p.salt === 'string' && typeof p.hash === 'string') ? p : null;
+};
+
+// Store the password hash record ({algo, salt, hash, setAt}) for the account.
+Persistence.prototype.setPassword = function (username, record) {
+	if (!record || typeof record !== 'object') return false;
+	const file = saveFileFor(username);
+	let existing = {};
+	try {
+		if (fs.existsSync(file)) existing = JSON.parse(fs.readFileSync(file, 'utf8'));
+	} catch (e) { /* overwrite */ }
+	if (!existing || typeof existing !== 'object') existing = {};
+	existing.password = record;
+	try {
+		const tmp = file + '.tmp';
+		fs.writeFileSync(tmp, JSON.stringify(existing, null, '\t'));
+		fs.renameSync(tmp, file);
+		return true;
+	} catch (e) {
+		console.error('[persistence] setPassword failed for ' + username + ':', e.message);
+		return false;
+	}
+};
+
+// Admin force-clear: the account becomes password-less, so its next login runs
+// the client's forced set-password flow. A missing hash is a cheap no-op.
+Persistence.prototype.clearPassword = function (username) {
+	const file = saveFileFor(username);
+	let existing = {};
+	try {
+		if (fs.existsSync(file)) existing = JSON.parse(fs.readFileSync(file, 'utf8'));
+	} catch (e) { /* overwrite */ }
+	if (!existing || typeof existing !== 'object') existing = {};
+	if (!existing.password) return true; // nothing to clear
+	delete existing.password;
+	try {
+		const tmp = file + '.tmp';
+		fs.writeFileSync(tmp, JSON.stringify(existing, null, '\t'));
+		fs.renameSync(tmp, file);
+		return true;
+	} catch (e) {
+		console.error('[persistence] clearPassword failed for ' + username + ':', e.message);
+		return false;
+	}
+};
+
 // 1.71.0: metadata only (newest first) for the client's rollback picker. The raw
 // mirror data stays on disk until loadSaveMirror asks for one entry.
 Persistence.prototype.listSaveMirrors = function (username) {

@@ -77,6 +77,13 @@ if (adminRouter) {
 	console.log('[admin] web UI enabled at /admin');
 }
 
+// 1.78.x: PUBLIC pre-login auth endpoints at /auth (password reset-code request
+// + confirm). The game client calls these from the login panel over plain HTTP
+// before the socket exists; CORS-open like /version. Brute-force protection is
+// per-account in accounts.js. Deps injected to avoid a circular require.
+var auth = require('./auth.js');
+app.use('/auth', auth.createRouter({ accounts: require('./accounts.js'), persistence: require('./persistence.js') }));
+
 app.get(/^(?!(\/media\/|\/data\/))/g, function(req, res){
 	res.status(404).end();
 });

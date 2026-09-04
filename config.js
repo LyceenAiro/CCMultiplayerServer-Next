@@ -107,6 +107,14 @@ const DEFAULTS = {
 	// { "label": "显示名", "map": "rookie-harbor.center", "marker": "entrance" }
 	// (marker optional; omit to land on the map's default spawn).
 	adminTeleports: [],
+	// 1.78.x (admin security): /admin is LOCAL-ONLY by default (127.0.0.1 / ::1
+	// always pass). List extra client IPs here to allow admin access from other
+	// devices. Entries: exact IPs ("203.0.113.7"), a trailing-* prefix for a
+	// whole LAN ("192.168.1.*"), or "*" to disable the restriction entirely
+	// (NOT recommended). The peer IP is read from the SOCKET, never from
+	// X-Forwarded-For (spoofable). IPv6-mapped IPv4 is normalized
+	// (::ffff:1.2.3.4 matches 1.2.3.4).
+	adminAllowIps: [],
 	// 1.74.x (player collision): whether online players collide with each other.
 	// false (default) = players NEVER block each other (walk-through everywhere,
 	// not just towns/cutscenes). true = normal player-vs-player collision.
@@ -129,12 +137,19 @@ const DEFAULTS = {
 	// account cannot trade for this many hours (item state was rewound, so
 	// trading would duplicate goods). 0 disables the lockout entirely.
 	tradeLockHours: 48,
+	// 1.78.x (progress wall): map IDs players may NOT enter (mod-undeveloped
+	// areas). A client attempting to enter one keeps its current map — the
+	// teleport is cancelled BEFORE any load, so the blocked map's story never
+	// runs — and gets a "wait for a future update" toast; anyone already inside
+	// is bounced back out. Accepts dotted ("heat-dng.f1.midboss") or slashed
+	// ("heat-dng/f1/midboss") form, case-insensitive. Empty list = feature off.
+	blockedMaps: [],
 };
 
 // Round 17: mod version. The server rejects any client whose mod version differs
 // (handshake gate in protocol.js). Bump this TOGETHER with the client mod version
 // (client src/multiplayer.ts MP_VERSION + package.json "version") on every release.
-const MOD_VERSION = '2.3.0';
+const MOD_VERSION = '0.2.4';
 
 function loadConfig() {
 	const cfg = Object.assign({}, DEFAULTS);
@@ -200,6 +215,44 @@ function loadConfig() {
 		{
 			const h = Number(cfg.tradeLockHours);
 			cfg.tradeLockHours = (isFinite(h) && h >= 0 && h <= 8760) ? h : DEFAULTS.tradeLockHours;
+		}
+		// 1.78.x (progress wall): sanitize to a deduped lowercase DOTTED-id list
+		// so the changeMap gate here and the client's teleport gate compare one
+		// canonical form. Bad entries are dropped silently (a typo must not break
+		// the login payload for everyone).
+		{
+			const out = [];
+			const seen = {};
+			const list = Array.isArray(cfg.blockedMaps) ? cfg.blockedMaps : [];
+			for (let i = 0; i < list.length && out.length < 256; i++) {
+				const raw = list[i];
+				if (typeof raw !== 'string') continue;
+				const id = raw.trim().toLowerCase().split('/').join('.');
+				if (!id || id.length > 128 || id.indexOf('..') !== -1 || seen[id]) continue;
+				seen[id] = true;
+				out.push(id);
+			}
+			cfg.blockedMaps = out;
+		}
+		// 1.78.x (admin security): sanitize the admin IP whitelist — lowercase
+		// trimmed strings of IP characters only, ::ffff: prefix normalized away,
+		// deduped. Bad entries are dropped silently (a typo must not lock the
+		// admin out — localhost ALWAYS passes regardless of this list).
+		{
+			const out = [];
+			const seen = {};
+			const list = Array.isArray(cfg.adminAllowIps) ? cfg.adminAllowIps : [];
+			for (let i = 0; i < list.length && out.length < 128; i++) {
+				const raw = list[i];
+				if (typeof raw !== 'string') continue;
+				let id = raw.trim().toLowerCase();
+				if (id.indexOf('::ffff:') === 0) id = id.slice(7);
+				if (!id || id.length > 64 || seen[id]) continue;
+				if (!/^[0-9a-f:.*]+$/.test(id)) continue;
+				seen[id] = true;
+				out.push(id);
+			}
+			cfg.adminAllowIps = out;
 		}
 	// Clamp the save bandwidth caps to a sane finite range [1, 65536] kb/s so a
 	// config typo can't turn the save stream into a firehose or a crawl.

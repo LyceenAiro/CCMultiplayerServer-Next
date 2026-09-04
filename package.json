@@ -1,7 +1,7 @@
 {
 	"name": "CCMultiplayerServer-Next",
 	"displayName": "CCMultiplayerServer-Next",
-	"version": "2.3.0",
+	"version": "0.2.4",
 	"description": "Relay server for the CrossCode multiplayer mod (CCMultiplayerClient-Next).",
 	"license": "MIT",
 	"author": "CCDirectLink, LyceenAiro",

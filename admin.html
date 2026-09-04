@@ -96,6 +96,21 @@ main { position:relative; z-index:1; display:flex; height:calc(100vh - 52px); }
 .badge.off { color:var(--dim); border-color:rgba(127,149,184,.30); background:rgba(127,149,184,.06); }
 .badge.off::before { content:""; width:5px; height:5px; border-radius:50%; background:var(--dim); opacity:.55; }
 
+/* 1.78.x: 重置验证码面板（有活跃验证码时显示在玩家列表上方） */
+#resetPanel { display:none; margin:10px 12px 0; padding:9px 12px 7px;
+  border:1px solid rgba(255,165,46,.55); border-radius:3px;
+  background:linear-gradient(180deg, rgba(255,165,46,.10), rgba(255,165,46,.04));
+  box-shadow:0 0 14px rgba(255,165,46,.12); }
+#resetPanel.on { display:block; }
+#resetPanel .rcTitle { font-size:11px; letter-spacing:.12em; color:var(--orange-hi); margin-bottom:6px; }
+#resetPanel .rcRow { display:flex; align-items:center; gap:8px; padding:3px 0; font-size:12px; }
+#resetPanel .rcName { color:var(--cyan); cursor:pointer; font-weight:600; }
+#resetPanel .rcName:hover { text-decoration:underline; }
+#resetPanel .rcCode { font:15px/1.25 Consolas,monospace; letter-spacing:.28em; color:var(--orange-hi);
+  background:rgba(8,14,28,.85); border:1px solid var(--line-hi); border-radius:3px;
+  padding:3px 6px 3px 10px; user-select:all; }
+#resetPanel .rcExp { color:var(--dim); font-size:11px; margin-left:auto; }
+
 /* ===== 右侧详情区 ===== */
 #detail { flex:1; overflow-y:auto; padding:22px 28px 40px; }
 #detail > * { max-width:960px; }
@@ -241,6 +256,7 @@ select option { background:#0b1426; }
 <main>
   <div id="listPanel">
     <div class="searchWrap"><input id="playerSearch" placeholder="搜索玩家（模糊）…" oninput="renderList()"></div>
+    <div id="resetPanel"></div>
     <div id="list"><div class="dim">加载中…</div></div>
   </div>
   <div id="detail"><div class="dim">← 选择左侧玩家查看详情</div></div>
@@ -317,8 +333,32 @@ function renderList() {
   var el0 = document.getElementById('list');
   var st0 = el0 ? el0.scrollTop : 0; // 保留滚动位置，热更新不打断浏览
   renderListInner();
+  renderResetPanel();
   var el1 = document.getElementById('list');
   if (el1) el1.scrollTop = st0;
+}
+
+// 1.78.x: 活跃的重置验证码面板 —— 客户端点"重置密码"后验证码出现在这里，
+// 管理员读给玩家（带外确认身份）。仅在有未过期验证码时显示；倒计时随轮询刷新。
+function renderResetPanel() {
+  var el = document.getElementById('resetPanel');
+  if (!el) return;
+  var now = Date.now();
+  var rows = [];
+  for (var i = 0; i < players.length; i++) {
+    var p = players[i];
+    if (p.reset && p.reset.code && Number(p.reset.expiresAt) > now) rows.push(p);
+  }
+  if (!rows.length) { el.className = ''; el.innerHTML = ''; return; }
+  el.className = 'on';
+  var html = '<div class="rcTitle">🔑 待使用的密码重置验证码（告知对应玩家）</div>';
+  html += rows.map(function(p){
+    var mins = Math.max(1, Math.ceil((Number(p.reset.expiresAt) - now) / 60000));
+    return '<div class="rcRow"><span class="rcName" onclick="loadDetail(\'' + encodeURIComponent(p.name) + '\')">' + esc(p.name) + '</span>' +
+      '<span class="rcCode">' + esc(p.reset.code) + '</span>' +
+      '<span class="rcExp">剩约 ' + mins + ' 分钟</span></div>';
+  }).join('');
+  el.innerHTML = html;
 }
 function renderListInner() {
   var el = document.getElementById('list');
@@ -340,6 +380,8 @@ function renderListInner() {
     var lockHtml = lm > 0
       ? ' <span style="color:var(--bad)">🔒 交易锁定 剩 ' + fmtLockRemain(lm) + '</span>'
       : '';
+    // 1.78.x: login brute-force lockout badge (wrong-password lock)
+    if (Number(p.loginLockedUntil) > Date.now()) lockHtml += ' <span style="color:var(--bad)">🔒 登录锁定</span>';
     return '<div class="player' + (p.name === current ? ' sel' : '') + '" onclick="loadDetail(\'' + encodeURIComponent(p.name) + '\')">' +
       '<div class="nm">' + esc(p.name) + ' <span class="badge ' + (p.online ? 'on' : 'off') + '">' + (p.online ? '在线' : '离线') + '</span></div>' +
       '<div class="sub">存档更新：' + fmtTime(p.updatedAt) + lockHtml + '</div></div>';
@@ -361,7 +403,14 @@ function sortPlayers() {
 // 列表内容指纹：内容没变就不重建 DOM，避免闪烁/打断
 function listKey() {
   // 锁定时长按小时粒度入指纹：到期/新锁定会触发重绘，分钟级流逝不打断浏览
-  return players.map(function(p){ return p.name + (p.online ? '1' : '0') + (p.updatedAt || '') + (lockRemainMs(p) > 0 ? 'L' + Math.ceil(lockRemainMs(p) / 3600000) : ''); }).join('|');
+  // 1.78.x: 重置验证码按分钟粒度入指纹（出现/消失/到期都会触发重绘倒计时）
+  return players.map(function(p){
+    return p.name + (p.online ? '1' : '0') + (p.updatedAt || '') +
+      (lockRemainMs(p) > 0 ? 'L' + Math.ceil(lockRemainMs(p) / 3600000) : '') +
+      (p.reset ? 'R' + p.reset.code + Math.ceil((Number(p.reset.expiresAt) - Date.now()) / 60000) : '') +
+      (Number(p.resetLockedUntil) > Date.now() ? 'K' : '') +
+      (Number(p.loginLockedUntil) > Date.now() ? 'G' : '');
+  }).join('|');
 }
 // 仅就地更新详情页头部的在线徽章（不重绘详情，不影响正在输入的内容）
 function updateDetailBadge() {
@@ -424,6 +473,23 @@ function renderDetail() {
   lockTxt += ' <span class="dim">（配置时长：' + (cfgH > 0 ? (cfgH + ' 小时，0 = 关闭') : '已关闭') + '）</span>';
   if (lu > Date.now()) lockTxt += ' <button class="ghost" style="margin-left:8px" onclick="clearTradeLock()">解除锁定</button>';
   html += '<div style="margin:2px 0 10px">交易锁定：' + lockTxt + '</div>';
+  // 1.78.x: 登录密码状态（管理员永远看不到密码本身，只能清除）+ 活跃重置验证码/锁定
+  var pwTxt = d.hasPassword
+    ? '<span style="color:var(--ok)">已设置</span>'
+    : '<span class="dim">未设置（下次登录将要求设置新密码）</span>';
+  pwTxt += ' <button class="ghost" style="margin-left:8px" onclick="clearPlayerPassword()">清除密码</button>';
+  if (d.reset && d.reset.code) {
+    pwTxt += ' <span class="dim">（活跃验证码：<b style="color:var(--orange-hi);letter-spacing:.2em">' + esc(d.reset.code) + '</b>，至 ' + fmtTime(new Date(Number(d.reset.expiresAt))) + '）</span>';
+  }
+  if (Number(d.resetLockedUntil) > Date.now()) {
+    pwTxt += ' <span style="color:var(--bad)">重置锁定中（至 ' + fmtTime(new Date(Number(d.resetLockedUntil))) + '）</span>';
+  }
+  // 1.78.x: 登录防暴力锁定（密码连续错误触发），管理员可提前解除
+  if (Number(d.loginLockedUntil) > Date.now()) {
+    pwTxt += ' <span style="color:var(--bad)">登录锁定中（密码错误次数过多，至 ' + fmtTime(new Date(Number(d.loginLockedUntil))) + '）</span>';
+    pwTxt += ' <button class="ghost" style="margin-left:8px" onclick="clearPlayerLoginLock()">解除登录锁定</button>';
+  }
+  html += '<div style="margin:2px 0 10px">登录密码：' + pwTxt + '</div>';
   if (!s) html += '<div class="dim">该玩家还没有主存档</div>';
   else if (s.corrupt) html += '<div class="dim">主存档无法解析（可能损坏）</div>';
   else {
@@ -466,6 +532,8 @@ function renderDetail() {
     teleports.map(function(t, i){ return '<option value="' + i + '">' + esc(t.label) + ' (' + esc(t.map) + ')</option>'; }).join('') +
     '</select><button onclick="doTeleport()">传送</button>' +
     '<span class="dim">传送点预设在 config.json 的 adminTeleports 中配置</span></div>';
+  html += '<div class="row"><button class="ghost" onclick="resetMapProgress()">🗺 重置其当前地图进度</button>' +
+    '<span class="dim">清空该玩家当前地图的持久进度变量并重载地图 —— 用于救回被队友任务进度污染的存档（如新矿井#1 无法开战）</span></div>';
   html += '</div>';
   document.getElementById('detail').innerHTML = html;
 }
@@ -482,6 +550,22 @@ async function clearTradeLock() {
   if (!confirm('确定解除玩家「' + current + '」的交易锁定？\n解除后其可立即交易。')) return;
   var j = await api('/player/' + encodeURIComponent(current) + '/clearTradeLock', { method: 'POST' });
   showMsg(j.ok, j.msg || (j.ok ? '交易锁定已解除' : '操作失败'));
+  if (j.ok) loadDetail(encodeURIComponent(current));
+}
+// 1.78.x: 强制清除玩家密码（同时作废未使用的重置验证码与重置锁定）
+async function clearPlayerPassword() {
+  if (!current) return;
+  if (!confirm('确定清除玩家「' + current + '」的登录密码？\n清除后该账号下次登录将要求设置新密码；未使用的重置验证码与锁定状态一并清除。')) return;
+  var j = await api('/player/' + encodeURIComponent(current) + '/clearPassword', { method: 'POST' });
+  showMsg(j.ok, j.msg || (j.ok ? '密码已清除' : '操作失败'));
+  if (j.ok) { try { await refreshAll(); } catch (e) {} }
+}
+// 1.78.x: 提前解除登录防暴力锁定（不动密码本身）
+async function clearPlayerLoginLock() {
+  if (!current) return;
+  if (!confirm('确定解除玩家「' + current + '」的登录锁定？\n解除后其可立即重新尝试登录。')) return;
+  var j = await api('/player/' + encodeURIComponent(current) + '/clearLoginLock', { method: 'POST' });
+  showMsg(j.ok, j.msg || (j.ok ? '登录锁定已解除' : '操作失败'));
   if (j.ok) loadDetail(encodeURIComponent(current));
 }
 function exportSave() {
@@ -563,6 +647,12 @@ async function toggleGod() {
     var btn = document.getElementById('godBtn');
     if (btn) { btn.textContent = next ? '🛡 无敌模式：开' : '🛡 无敌模式：关'; btn.className = next ? '' : 'ghost'; }
   } else showMsg(false, j.msg);
+}
+async function resetMapProgress() {
+  if (!current) return;
+  if (!confirm('确定重置玩家「' + current + '」当前所在地图的进度？\n该地图的持久变量会被清空并重载（宝箱/机关/任务门控回到初始状态）。剧情或战斗中会被客户端拒绝。')) return;
+  var j = await api('/online/' + encodeURIComponent(current) + '/resetMap', { method: 'POST' });
+  showMsg(j.ok, j.ok ? ('已重置' + (j.msg ? '：' + j.msg : '')) : j.msg);
 }
 async function doTeleport() {
   var i = document.getElementById('tpSel').value;

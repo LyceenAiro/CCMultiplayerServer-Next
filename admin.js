@@ -2,6 +2,8 @@
 //
 // Mounted at /admin (server.js). Everything except the static page requires the
 // configured adminToken (config.json "adminToken"; empty = admin UI DISABLED).
+// 1.78.x (security): the WHOLE mount — static page AND API — is additionally
+// IP-gated: localhost only unless config.adminAllowIps whitelists the client IP.
 //
 // Features:
 //   - list players (online status, last-seen, save timestamp)
@@ -60,6 +62,27 @@ function sendCommand(name, payload) {
 }
 
 // ---- helpers ----
+// 1.78.x: password/reset state for the admin page. "game" is the already-loaded
+// per-user save object (the password hash lives there); "acc" is the db.json
+// account record (reset code + lockout live there). The admin sees the active
+// reset CODE (that hand-off is the identity check) but NEVER the password —
+// only its salted hash exists and it is not exposed here either.
+function passwordState(game, acc) {
+	const now = Date.now();
+	let reset = null;
+	if (acc && acc.resetCode && Number(acc.resetCode.expiresAt) > now && typeof acc.resetCode.code === 'string') {
+		reset = { code: acc.resetCode.code, expiresAt: Number(acc.resetCode.expiresAt) };
+	}
+	return {
+		hasPassword: !!(game && game.password && game.password.hash),
+		reset,
+		resetLockedUntil: (acc && Number(acc.resetLockedUntil) > now) ? Number(acc.resetLockedUntil) : 0,
+		// 1.78.x: login brute-force lockout (wrong passwords) — admin can see
+		// it here and lift it early via clearLoginLock.
+		loginLockedUntil: (acc && Number(acc.loginLockedUntil) > now) ? Number(acc.loginLockedUntil) : 0,
+	};
+}
+
 function itemName(id) {
 	const it = itemdb.all().items.find((x) => x.id === id);
 	if (!it) return null;
@@ -136,16 +159,52 @@ function saveFileForPublic(username) {
 	return path.join(__dirname, 'data', 'saves', encodeURIComponent(username) + '.' + h.toString(36) + '.json');
 }
 
+// ---- 1.78.x (admin security): IP gate helpers ----
+// The peer IP comes from the SOCKET — X-Forwarded-For is NEVER trusted (a
+// client can set that header to anything, so honoring it would make the whole
+// gate spoofable). localhost ALWAYS passes, whatever the config says, so a
+// bad whitelist can never lock the machine's own admin out.
+function adminClientIp(req) {
+	let ip = (req.socket && req.socket.remoteAddress) || '';
+	if (ip.indexOf('::ffff:') === 0) ip = ip.slice(7); // IPv6-mapped IPv4
+	return String(ip).toLowerCase();
+}
+function adminIpAllowed(ip, list) {
+	for (let i = 0; i < list.length; i++) {
+		const e = list[i];
+		if (e === '*') return true;
+		if (e.charAt(e.length - 1) === '*') {
+			if (ip.indexOf(e.slice(0, -1)) === 0) return true;
+		} else if (ip === e) return true;
+	}
+	return false;
+}
+
 // ---- router ----
 function createRouter(config) {
 	const router = express.Router();
-	router.use(express.json({ limit: '12mb' }));
 
 	const token = typeof config.adminToken === 'string' ? config.adminToken : '';
 	if (!token) {
 		console.warn('[admin] adminToken is empty in config.json — admin UI DISABLED');
 		return null;
 	}
+
+	// 1.78.x (admin security): IP gate FIRST — covers the static page AND every
+	// API route, and runs before the body parser so a denied remote request
+	// costs almost nothing. Default LOCAL-ONLY (127.0.0.1 / ::1 always pass);
+	// config.adminAllowIps adds remote IPs (exact / trailing-* prefix / '*' =
+	// restriction off). Denied requests are logged with their source IP.
+	const allowIps = Array.isArray(config.adminAllowIps) ? config.adminAllowIps : [];
+	router.use((req, res, next) => {
+		const ip = adminClientIp(req);
+		if (ip === '127.0.0.1' || ip === '::1' || adminIpAllowed(ip, allowIps)) return next();
+		console.warn('[admin] blocked non-local access from ' + (ip || '?') + ' to ' + req.originalUrl);
+		res.status(403).json({ ok: false, msg: '管理页面仅允许本机或白名单 IP 访问 (admin access: localhost or whitelisted IPs only)' });
+	});
+	console.log('[admin] access: localhost only' + (allowIps.length ? ' + whitelist [' + allowIps.join(', ') + ']' : ''));
+
+	router.use(express.json({ limit: '12mb' }));
 
 	router.use('/api', (req, res, next) => {
 		const t = req.get('x-admin-token') || req.query.token || '';
@@ -165,15 +224,19 @@ function createRouter(config) {
 			const a = db.accounts[name];
 			let updatedAt = null;
 			let tradeLockUntil = 0;
+			let pwGame = null;
 			try {
 				const g = persistence.loadGame(name);
+				pwGame = g;
 				if (g && typeof g.updatedAt === 'string') updatedAt = g.updatedAt;
 				// Anti-dupe trade lockout deadline (epoch ms, 0 = not locked) — from
 				// the same save object loadGame just read; no extra IO.
 				const u = g && Number(g.tradeLockedUntil);
 				if (isFinite(u) && u > 0) tradeLockUntil = u;
 			} catch (e) { /* ignore */ }
-			out.push({ name, online: accounts.isOnline(name), lastSeen: a.lastSeen || null, createdAt: a.createdAt || null, updatedAt, tradeLockUntil });
+			// 1.78.x: password/reset-code state (hash lives in the same save object).
+			const pw = passwordState(pwGame, a);
+			out.push({ name, online: accounts.isOnline(name), lastSeen: a.lastSeen || null, createdAt: a.createdAt || null, updatedAt, tradeLockUntil, hasPassword: pw.hasPassword, reset: pw.reset, resetLockedUntil: pw.resetLockedUntil, loginLockedUntil: pw.loginLockedUntil });
 		}
 		out.sort((x, y) => (y.online - x.online) || String(x.name).localeCompare(String(y.name)));
 		res.json({ ok: true, players: out, tradeLockHours: config.tradeLockHours });
@@ -185,10 +248,16 @@ function createRouter(config) {
 		if (!accounts.exists(name) || bots.isBotName(name)) return res.status(404).json({ ok: false, msg: '玩家不存在' });
 		const game = persistence.loadGame(name);
 		const save = game && typeof game.autoSlot === 'string' ? summarizeSave(game.autoSlot) : null;
+		const pw = passwordState(game, accounts.getAccount(name));
 		res.json({
 			ok: true, name, online: accounts.isOnline(name),
 			save,
 			mirrors: persistence.listSaveMirrors(name),
+			// 1.78.x: password + active reset-code state for the detail panel.
+			hasPassword: pw.hasPassword,
+			reset: pw.reset,
+			resetLockedUntil: pw.resetLockedUntil,
+			loginLockedUntil: pw.loginLockedUntil,
 			// Anti-dupe trade lockout: deadline (epoch ms, 0 = not locked) + the
 			// configured duration, so the page can show both.
 			tradeLockUntil: persistence.getTradeLock(name),
@@ -265,6 +334,40 @@ function createRouter(config) {
 		res.json({ ok: true, msg, tradeLockUntil: persistence.getTradeLock(name) });
 	});
 
+	// 1.78.x: force-clear a player's login password (admin override). Removes the
+	// scrypt hash from the per-user save file AND wipes any pending reset code /
+	// lockout, so the account becomes password-less: its next login runs the
+	// client's forced set-password flow. An online player keeps their current
+	// (already-authenticated) session — the gate applies at the NEXT handshake.
+	router.post('/api/player/:name/clearPassword', (req, res) => {
+		const name = req.params.name;
+		if (!accounts.exists(name) || bots.isBotName(name)) return res.status(404).json({ ok: false, msg: '玩家不存在' });
+		if (!persistence.clearPassword(name)) return res.status(500).json({ ok: false, msg: '写入失败' });
+		const acc = accounts.getAccount(name);
+		if (acc) {
+			delete acc.resetCode;
+			acc.resetFails = [];
+			delete acc.resetLockedUntil;
+			// 1.78.x: also wipe the login brute-force state (fresh start).
+			acc.loginFails = [];
+			delete acc.loginLockedUntil;
+			persistence.save();
+		}
+		console.log('[admin] password cleared for ' + name);
+		res.json({ ok: true, msg: '密码已清除' + (accounts.isOnline(name) ? '；该玩家当前在线，本次会话不受影响' : '') + '；下次登录将要求设置新密码' });
+	});
+
+	// 1.78.x: lift a login brute-force lockout early (admin override). Clears
+	// the rolling fail window AND the lock deadline; the password itself is
+	// untouched. Works for offline players too (the gate applies at handshake).
+	router.post('/api/player/:name/clearLoginLock', (req, res) => {
+		const name = req.params.name;
+		if (!accounts.exists(name) || bots.isBotName(name)) return res.status(404).json({ ok: false, msg: '玩家不存在' });
+		accounts.clearLoginState(name);
+		console.log('[admin] login lock cleared for ' + name);
+		res.json({ ok: true, msg: '登录锁定已解除' });
+	});
+
 	// ---- debug commands (require online) ----
 	const needOnline = (req, res) => {
 		const name = req.params.name;
@@ -302,6 +405,16 @@ function createRouter(config) {
 		const on = !!(req.body && req.body.on);
 		res.json(await sendCommand(name, { kind: 'godMode', on }));
 	});
+	// 1.77.x: reset the map the player is CURRENTLY on back to pristine state —
+	// the client clears that map's persisted var namespace (ig.vars.storage.maps[map])
+	// and reloads the map. Rescues saves whose quest-map progress vars were polluted
+	// (e.g. by an accidental regroup into a teammate's mid-quest instance: the
+	// battle-start console on miners-bombquest-1 is gated by !map.bombsOn, so a
+	// polluted save can never start the battle again).
+	router.post('/api/online/:name/resetMap', async (req, res) => {
+		const name = needOnline(req, res); if (!name) return;
+		res.json(await sendCommand(name, { kind: 'resetMap' }));
+	});
 	router.post('/api/online/:name/teleport', async (req, res) => {
 		const name = needOnline(req, res); if (!name) return;
 		const b = req.body || {};
@@ -325,4 +438,4 @@ function createRouter(config) {
 	return router;
 }
 
-module.exports = { createRouter, resolveAck };
+module.exports = { createRouter, resolveAck, sendCommand };

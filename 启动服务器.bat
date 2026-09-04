@@ -57,7 +57,7 @@ if defined OLD_PIDS (
 )
 
 echo.
-echo Starting CCMultiplayerServer-Next v2.3.0 on port %USE_PORT%...
+echo Starting CCMultiplayerServer-Next v0.2.4 on port %USE_PORT%...
 echo Close this window or press Ctrl+C to stop the server.
 set "PORT=%USE_PORT%"
 node server.js

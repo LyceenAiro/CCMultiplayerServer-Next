@@ -10,6 +10,7 @@ const world = require('./world');
 const persistence = require('./persistence');
 const config = require('./config');
 const savecodec = require('./savecodec');
+const auth = require('./auth');
 const { isValidName, isValidEntityId, isValidPos, isValidSlotKey } = require('./validate');
 
 // ctx passed to modules: lets them reach sockets / online checks without a
@@ -566,6 +567,38 @@ function handleConnection(socket) {
 			}
 		}
 
+		// 1.78.x: password gate. Accounts with a password hash (stored as a
+		// salted scrypt record in the per-user save file — never the plaintext)
+		// must present a matching password on EVERY handshake (first connect and
+		// reconnects alike). Legacy password-less accounts pass and are flagged
+		// passwordRequired in the response so the client forces a set-password
+		// dialog when they enter the game. The reset flow (forgotten password)
+		// runs over public HTTP BEFORE this socket exists — see auth.js.
+		// Brute-force guard (accounts.js): the lock is checked BEFORE the
+		// password is verified at all; every wrong password counts in a rolling
+		// 10-minute window and the 5th locks the account for 10 minutes.
+		const lockChk = accounts.checkLoginLock(name);
+		if (!lockChk.ok) {
+			console.log('[protocol] rejected login for ' + name + ' (login locked, ' + Math.ceil(lockChk.lockedMs / 60000) + 'min left)');
+			socket.emit('handshakeResponse', { failed: lockChk.msg, authFailed: 'locked' });
+			return;
+		}
+		const pwRec = persistence.getPassword(name);
+		if (pwRec) {
+			const pw = data && typeof data.password === 'string' ? data.password : '';
+			if (!auth.verifyPassword(pw, pwRec)) {
+				const fail = accounts.recordLoginFail(name);
+				console.log('[protocol] rejected login for ' + name + ' (wrong password' + (fail.locked ? ' — now LOCKED' : ', ' + fail.failsLeft + ' attempts left') + ')');
+				// authFailed flag lets the client distinguish auth rejections
+				// (reopen the login panel with the server's hint) from every
+				// other rejection; the message carries attempts-left / lock time.
+				socket.emit('handshakeResponse', { failed: fail.msg, authFailed: fail.locked ? 'locked' : 'password' });
+				return;
+			}
+			// Successful password login: reset the brute-force counter.
+			accounts.clearLoginState(name);
+		}
+
 		username = name;
 		const { isNew } = accounts.login(name, socket);
 		if (!isReconnect) {
@@ -644,6 +677,10 @@ function handleConnection(socket) {
 			// ...plus the CONFIGURED lock duration so client-side messages can name
 			// the real number instead of a hardcoded "48 小时".
 			tradeLockHours: config.tradeLockHours,
+			// 1.78.x (progress wall): blocked map IDs (already sanitized to
+			// lowercase dotted form by config.js). The client gates teleports to
+			// these maps at INTENT so a blocked map is never loaded at all.
+			blockedMaps: config.blockedMaps,
 			// Round 17: the accepted server version (harmless; useful for logs — the
 			// client already sent its own version in the handshake payload).
 			version: config.version,
@@ -651,6 +688,9 @@ function handleConnection(socket) {
 			// 1.71.0: save-mirror metadata (newest first). Always present in mirror
 			// mode; omitted otherwise to keep the normal handshake unchanged.
 			mirrors: mirrorMode ? persistence.listSaveMirrors(name) : undefined,
+			// 1.78.x: true when the account has NO password hash yet (legacy / brand
+			// new) — the client forces a set-password dialog on entering the game.
+			passwordRequired: !pwRec,
 		});
 		// Round 23: the save is NO LONGER embedded in the handshakeResponse (that
 		// sent a ~60KB string in one packet). It is streamed as paced saveDownload
@@ -688,6 +728,25 @@ function handleConnection(socket) {
 		if (!username) return;
 		console.log('[protocol] ' + username + ' logged out (client-initiated)');
 		doLogout();
+	});
+
+	// 1.78.x: set/change the account password (authed only). The client's forced
+	// set-password dialog (passwordRequired accounts) calls this on entering the
+	// game; it also covers a future voluntary change-password UI. Stores ONLY a
+	// salted scrypt hash in the per-user save file.
+	socket.on('setPassword', function (data) {
+		if (dropIfNotAuthed('setPassword')) return;
+		const pw = data && typeof data.password === 'string' ? data.password : '';
+		if (!auth.isValidPassword(pw)) {
+			socket.emit('setPasswordResult', { ok: false, msg: '密码需为 4-64 个字符 (password must be 4-64 chars)' });
+			return;
+		}
+		if (!persistence.setPassword(username, auth.hashPassword(pw))) {
+			socket.emit('setPasswordResult', { ok: false, msg: '密码写入失败，请重试 (failed to store the password — retry)' });
+			return;
+		}
+		console.log('[protocol] ' + username + ' set a login password');
+		socket.emit('setPasswordResult', { ok: true });
 	});
 
 	function doLogout() {
@@ -752,6 +811,15 @@ function handleConnection(socket) {
 		}
 		if (typeof data.areaType !== 'undefined' && (areaType < 0 || areaType > 2)) {
 			socket.emit('changeMapResponse', { failed: 'bad areaType' });
+			return;
+		}
+		// 1.78.x (progress wall): refuse routing into a server-blocked map. The
+		// client's teleport gate normally cancels these BEFORE any request; this
+		// is the authoritative backstop (stale/edited client). The client's veto
+		// handling cancels the pending load on failed === 'blocked'.
+		if (config.blockedMaps && config.blockedMaps.indexOf(String(mapName).toLowerCase().split('/').join('.')) !== -1) {
+			console.log('[protocol] progress wall: ' + username + ' denied entry to blocked map ' + mapName);
+			socket.emit('changeMapResponse', { failed: 'blocked' });
 			return;
 		}
 
@@ -3952,7 +4020,9 @@ function handleConnection(socket) {
 			// client's onSaveFailed toast shows the reason.
 			const guard = validateSaveUpload(username, stream.slot, payload);
 			if (!guard.ok) {
-				socket.emit('saveFailed', { slot: stream.slot, reason: guard.reason });
+				// prevLevel rides along on a levelReset rejection so the client can
+				// show the exact regression ("level N -> 1") in its blocking dialog.
+				socket.emit('saveFailed', { slot: stream.slot, reason: guard.reason, prevLevel: guard.prevLevel });
 				return;
 			}
 			persistence.saveGame(username, stream.slot, sanitizeSaveParty(payload));
@@ -4004,10 +4074,39 @@ function handleConnection(socket) {
 				console.warn('[protocol] rejected tiny save for ' + username + ': ' + payload.length + ' chars vs stored ' + cur.length + ' chars');
 				return { ok: false, reason: 'tooSmall' };
 			}
+			// 1.77.x: LEVEL-REGRESSION guard. The stored save has real progress
+			// (player level > 1) but the incoming save reports level 1 — the
+			// client's save state was silently reset underneath it (a broken
+			// restore / fresh-save race, same family as the tiny-save case but
+			// undetectable by size). Reject and keep the stored save; the client
+			// answers reason 'levelReset' with a blocking dialog that sends the
+			// player back to the title screen to re-login and re-download the
+			// intact cloud save. Checked on EVERY save while the stored level is
+			// not 1. (prevLevel 0/1 = fresh save — nothing to protect.)
+			const newLevel = obj.player && typeof obj.player.level === 'number' ? obj.player.level : null;
+			if (newLevel === 1 && cur) {
+				const prevLevel = extractSaveLevel(cur);
+				if (prevLevel !== null && prevLevel > 1) {
+					console.warn('[protocol] rejected level-reset save for ' + username + ': stored level ' + prevLevel + ' -> incoming level 1');
+					return { ok: false, reason: 'levelReset', prevLevel: prevLevel };
+				}
+			}
 			return { ok: true };
 		} catch (e) {
 			return { ok: false, reason: 'invalid' };
 		}
+	}
+	// Read the player level out of a stored save slot (encrypted or raw JSON).
+	// Returns null when unparseable — the caller then skips the regression guard
+	// (a stored save we cannot read must not block uploads on its own).
+	function extractSaveLevel(src) {
+		try {
+			if (typeof src !== 'string' || !src.length) return null;
+			const o = savecodec.isEncryptedSlot(src) ? savecodec.decryptSlotData(src) : JSON.parse(src);
+			if (!o || typeof o !== 'object') return null;
+			const p = o.player;
+			return p && typeof p.level === 'number' && isFinite(p.level) ? p.level : null;
+		} catch (e) { return null; }
 	}
 	const NATIVE_PARTY = { Lea: 1, Shizuka: 1, Shizuka0: 1, Emilie: 1, Sergey: 1, Schneider: 1, Schneider2: 1, Hlin: 1, Grumpy: 1, Buggy: 1, Glasses: 1, Apollo: 1, Joern: 1, Triblader1: 1, Luke: 1 };
 	function sanitizeSaveParty(raw) {
