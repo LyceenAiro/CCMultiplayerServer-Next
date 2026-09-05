@@ -2235,6 +2235,18 @@ function handleConnection(socket) {
 		world.broadcastToInstance(ctx, username, 'bounceFx', { map: data.map, mi: data.mi, k });
 	});
 
+	// ROUND 165 (steam-oven FX relay): a client's ice disk melted into a steam oven —
+	// the ovenActivate burst + pipe steam propagation (moving glow / outlet steam)
+	// are local-only vanilla side effects; relay one compact event so same-instance
+	// peers replay them natively on their own oven copy. mi = oven mapId.
+	socket.on('steamOven', function (data) {
+		if (dropIfNotAuthed('steamOven')) return;
+		if (rateLimited('steamOven', 10)) return;
+		if (!data || typeof data.map !== 'string' || data.map.length > 96) return;
+		if (typeof data.mi !== 'number' || !Number.isInteger(data.mi) || data.mi <= 0) return;
+		world.broadcastToInstance(ctx, username, 'steamOven', { map: data.map, mi: data.mi });
+	});
+
 	// 1.73.x: the host's EnemyCounter reached 0 (battle done). Members' counters
 	// never count puppet deaths, so the relayed battle-done cutscene would block
 	// forever on its post variable. Host relays the resolution once; receivers set
