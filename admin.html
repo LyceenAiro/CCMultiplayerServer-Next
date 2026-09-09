@@ -111,6 +111,17 @@ main { position:relative; z-index:1; display:flex; height:calc(100vh - 52px); }
   padding:3px 6px 3px 10px; user-select:all; }
 #resetPanel .rcExp { color:var(--dim); font-size:11px; margin-left:auto; }
 
+/* 1.80.x: 边栏服务器状态（在线人数 / 实时流量，随 /players 轮询刷新） */
+#statsBox { margin:10px 12px 0; padding:8px 12px 9px;
+  border:1px solid var(--line); border-radius:3px;
+  background:linear-gradient(180deg, rgba(19,29,53,.72), rgba(12,19,37,.72)); }
+#statsBox .stRow { display:flex; align-items:baseline; justify-content:space-between; gap:10px; padding:2px 0; }
+#statsBox .stK { color:var(--dim); font-size:11px; letter-spacing:.12em; white-space:nowrap; }
+#statsBox .stV { font:12px/1.45 Consolas,monospace; letter-spacing:.03em; text-align:right; white-space:nowrap; }
+#statsBox .stV b { color:var(--cyan); font-weight:600; }
+#statsBox .stV .up { color:var(--ok); }
+#statsBox .stV .down { color:var(--orange-hi); }
+
 /* ===== 右侧详情区 ===== */
 #detail { flex:1; overflow-y:auto; padding:22px 28px 40px; }
 #detail > * { max-width:960px; }
@@ -256,6 +267,10 @@ select option { background:#0b1426; }
 <main>
   <div id="listPanel">
     <div class="searchWrap"><input id="playerSearch" placeholder="搜索玩家（模糊）…" oninput="renderList()"></div>
+    <div id="statsBox">
+      <div class="stRow"><span class="stK">玩家 在线/总数</span><span class="stV" id="stOnline">—</span></div>
+      <div class="stRow"><span class="stK">流量 <span class="up">↑</span>/<span class="down">↓</span></span><span class="stV tip" id="stTraffic">—</span></div>
+    </div>
     <div id="resetPanel"></div>
     <div id="list"><div class="dim">加载中…</div></div>
   </div>
@@ -313,11 +328,39 @@ function lockRemainMs(p) {
 }
 function esc(s) { return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 
+// 1.80.x: 边栏服务器状态 —— 在线人数与服务器实时流量（随 /players 轮询每 3s 刷新；
+// 流量值为服务器端最近 1 秒窗口的字节速率）。流量的 1 分钟平均值写进 data-tip，
+// 由下方通用悬浮窗（#tooltip）在鼠标悬停时显示。
+function fmtBps(n) {
+  n = Math.max(0, Number(n) || 0);
+  if (n < 1024) return Math.round(n) + ' B/s';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB/s';
+  return (n / 1048576).toFixed(2) + ' MB/s';
+}
+function renderStats(st) {
+  if (!st) return;
+  var onEl = document.getElementById('stOnline');
+  if (onEl) {
+    var onHtml = '<b>' + (Number(st.online) || 0) + '</b> / ' + (Number(st.total) || 0);
+    if (onEl.innerHTML !== onHtml) onEl.innerHTML = onHtml;
+  }
+  var tfEl = document.getElementById('stTraffic');
+  if (tfEl) {
+    var tfHtml = '<span class="up">↑</span> <b>' + fmtBps(st.upBps) + '</b> <span class="down">↓</span> <b>' + fmtBps(st.downBps) + '</b>';
+    if (tfEl.innerHTML !== tfHtml) tfEl.innerHTML = tfHtml;
+    var tip = '<div class="tname">服务器流量 · 最近 1 分钟平均</div>' +
+      '<div class="stat"><span><span class="up">↑</span> 上传（服务器 → 客户端）</span><span class="v up">' + fmtBps(st.upAvgBps) + '</span></div>' +
+      '<div class="stat"><span><span class="down">↓</span> 下载（客户端 → 服务器）</span><span class="v down">' + fmtBps(st.downAvgBps) + '</span></div>';
+    if (tfEl.getAttribute('data-tip') !== tip) tfEl.setAttribute('data-tip', tip);
+  }
+}
+
 async function refreshAll() {
   try {
     var j = await api('/players');
     players = j.players || [];
     if (typeof j.tradeLockHours === 'number') tradeLockHours = j.tradeLockHours;
+    renderStats(j.stats);
     sortPlayers();
     renderList();
     if (current) await loadDetail(encodeURIComponent(current));
@@ -433,6 +476,7 @@ async function pollPlayers() {
     var before = listKey();
     players = j.players || [];
     if (typeof j.tradeLockHours === 'number') tradeLockHours = j.tradeLockHours;
+    renderStats(j.stats); // 流量每轮都在变，不入 listKey 指纹，直接热更新
     sortPlayers();
     if (listKey() !== before) { renderList(); updateDetailBadge(); }
   } catch (e) { /* 轮询静默失败，绝不打断当前操作 */ }
@@ -720,6 +764,10 @@ document.addEventListener('mouseover', function(ev){
   tipEl = t;
   var box = document.getElementById('tooltip');
   if (!t) { box.style.display = 'none'; return; }
+  // 1.80.x: 通用文本悬浮窗 —— data-tip 直接携带 HTML 内容（如边栏流量的 1 分钟平均），
+  // 不走物品查询。
+  var tipHtml = t.getAttribute('data-tip');
+  if (tipHtml) { box.innerHTML = tipHtml; box.style.display = 'block'; return; }
   var id = parseInt(t.getAttribute('data-item'), 10);
   var it = findItem(id);
   if (!it) { box.style.display = 'none'; return; }

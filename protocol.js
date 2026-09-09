@@ -67,6 +67,34 @@ const tradeSessions = new Map(); // sid -> {a, b, offer:{a:[],b:[]}, ready:{a:0,
 let tradeSidSeq = 1;
 const tradeLog = []; // last 200 completed trades: {at, a, b, loseA, gainA, ratio}
 
+// ---- 1.80.x (idle kick): server-side AFK watchdog (backstop) ----
+// The client enforces the graceful path itself (config afkField/afkTown arrive in
+// the handshake: toast + disconnect + back to the title screen), but a patched
+// client could simply not comply. The watchdog is the authoritative backstop: a
+// socket whose _mpLastActive (advanced ONLY by real input — the netPing `ia`
+// flag, set at auth) is older than the player's CURRENT area limit gets an
+// afkKick notice and is disconnected a moment later. Threshold follows the
+// socket's _mpAreaType (0 = town, tracked from changeMap; anything else =
+// field/dungeon). 0 disables that area's kick. Runs every 15s.
+setInterval(function () {
+	try {
+		if (config.afkFieldMinutes <= 0 && config.afkTownMinutes <= 0) return;
+		const now = Date.now();
+		for (const name of accounts.onlineNames()) {
+			const sock = accounts.getSocket(name);
+			if (!sock || !sock.connected) continue;
+			const last = typeof sock._mpLastActive === 'number' ? sock._mpLastActive : 0;
+			if (!last) continue;
+			const limitMin = (sock._mpAreaType === 0) ? config.afkTownMinutes : config.afkFieldMinutes;
+			if (limitMin <= 0) continue;
+			if (now - last < limitMin * 60000) continue;
+			console.log('[protocol] afk kick: ' + name + ' (idle ' + Math.round((now - last) / 60000) + 'min > ' + limitMin + 'min limit)');
+			try { sock.emit('afkKick', { minutes: limitMin }); } catch (e) { /* ignore */ }
+			(function (s) { setTimeout(function () { try { s.disconnect(false); } catch (e) { /* ignore */ } }, 150); })(sock);
+		}
+	} catch (e) { /* the watchdog must never crash the process */ }
+}, 15000);
+
 function tradeValidateItems(raw) {
 	if (!Array.isArray(raw) || raw.length === 0 || raw.length > 16) return null;
 	const seen = Object.create(null);
@@ -104,6 +132,902 @@ function tradeCloseSessionsFor(ctxObj, name) {
 	for (const sid of Array.from(tradeSessions.keys())) {
 		const s = tradeSessions.get(sid);
 		if (s && (s.a === name || s.b === name)) tradeCloseSession(ctxObj, sid, 'disconnect');
+	}
+}
+
+// ---- 1.79.x (bandwidth): wire-schema negotiation, per PARTY ----
+// Players pick 标准 ('c' = compact binary) or 调试 ('d' = short-key JSON) in the
+// mod options and report it via the handshake (`schema`) / netSchemaPref. The
+// server arbitrates the PARTY-WIDE effective mode:
+//   - every member prefers 'd'                    -> 'd'
+//   - any member reports no preference (old build) -> 'legacy' (long-key JSON)
+//   - anything else (a 'c' anywhere in the mix)    -> 'c'
+// Party-less players are a party of one. The mode is pushed to the members as
+// `netSchema {mode}` whenever it changes (preference update, logout; roster
+// changes are covered by the CLIENT re-asserting its preference on every
+// partyUpdate). Relays are re-encoded per RECEIVER in that receiver's mode, so
+// mixed instances and old clients keep working.
+function netSchemaPrefOf(name) {
+	const sock = ctx.getSocket(name);
+	return (sock && sock._mpSchemaPref) ? sock._mpSchemaPref : null;
+}
+function netSchemaFor(name) {
+	const pid = party.partyOf(name);
+	const members = (pid && party.getParty(pid)) ? party.getParty(pid).members : [name];
+	let allD = true;
+	for (const m of members) {
+		const pref = netSchemaPrefOf(m);
+		if (!pref) return 'legacy';
+		if (pref !== 'd') allD = false;
+	}
+	return allD ? 'd' : 'c';
+}
+function netSchemaRecomputeFor(name) {
+	const pid = party.partyOf(name);
+	const members = (pid && party.getParty(pid)) ? party.getParty(pid).members.slice() : [name];
+	for (const n of members) {
+		const s = ctx.getSocket(n);
+		if (s && s.connected) s.emit('netSchema', { mode: netSchemaFor(n) });
+	}
+}
+
+// ---- 1.79.x (bandwidth): wire codec for the three hot streams ----
+// Mirrors the client's src/sync/wireSchema.ts BYTE FOR BYTE — keep both in sync!
+// 'c' 标准 = compact binary ({player|from, d:<bytes>}); 'd' 调试 = short-key JSON
+// with default-omission ({player|from, k:{...}}); 'legacy' = long-key JSON.
+// The server DECODES any inbound format into canonical long-key objects (the
+// existing per-field whitelists then run unchanged) and RE-ENCODES per receiver
+// in that receiver's party-effective schema, so 标准/调试/old clients mix freely.
+const WIRE_STR_DICT = [
+	'idle', 'walk', 'guard', 'dash', 'attack', 'throw', 'hit', 'special', 'charge', 'charged',
+	'aim', 'dead', 'jump', 'fall', 'land', 'run', 'talk', 'sit', 'carry', 'push', 'pull',
+	'climb', 'ladder', 'swim', 'dodge', 'counter', 'melee', 'ranged',
+	'triblader', 'pentafist', 'spheromancer', 'hexacast', 'avenger', 'leatanks', 'player',
+	'rookie-harbor', 'rhombus-sqr', 'basin-keep', 'copan', 'bridge', 'autumn-fall', 'arid-fond', 'offbeat',
+	'heat-dng', 'cold-dng', 'shock-dng', 'wave-dng', 'tree-dng', 'jungle', 'sohn', 'cargo', 'ship', 'lab', 'math', 'rx',
+	// 1.80.x (combat streams): enemy anim/AI-state strings + the entityState
+	// target sentinel. Appended at the TAIL so the 1.79.x codes stay stable.
+	'default', 'show', 'hide', 'earthIn', 'earthOut', 'walkAround', 'fly', 'spinShield',
+	'hitStun', 'knockback', 'spawn', 'vanish', '__host__',
+];
+const WIRE_STR_INDEX = {};
+WIRE_STR_DICT.forEach(function (s, i) { WIRE_STR_INDEX[s] = i + 1; });
+
+function WireWriter() { this.bytes = []; }
+WireWriter.prototype.u8 = function (v) { this.bytes.push(v & 0xff); };
+WireWriter.prototype.i8 = function (v) { v = (v < -128 ? -128 : v > 127 ? 127 : v); this.bytes.push(v & 0xff); };
+WireWriter.prototype.u8c = function (v, lo, hi) { v = Math.round(v); this.bytes.push((v < lo ? lo : v > hi ? hi : v) & 0xff); };
+WireWriter.prototype.var = function (n) {
+	let v = Math.max(0, Math.round(n));
+	while (v >= 0x80) { this.bytes.push((v & 0x7f) | 0x80); v = Math.floor(v / 128); }
+	this.bytes.push(v);
+};
+WireWriter.prototype.zig = function (n) { const v = Math.round(n); this.var((v << 1) ^ (v >> 31)); };
+WireWriter.prototype.str = function (s) {
+	if (!s) { this.u8(0); return; }
+	const code = WIRE_STR_INDEX[s];
+	if (code) { this.u8(code); return; }
+	s = String(s);
+	const utf8 = [];
+	for (let i = 0; i < s.length; i++) {
+		const c = s.charCodeAt(i);
+		if (c < 0x80) utf8.push(c);
+		else if (c < 0x800) utf8.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+		else utf8.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+	}
+	this.u8(128);
+	this.var(utf8.length);
+	for (let i = 0; i < utf8.length; i++) this.bytes.push(utf8[i] & 0xff);
+};
+WireWriter.prototype.out = function () { return new Uint8Array(this.bytes); };
+
+function WireReader(buf) { this.b = buf; this.p = 0; }
+WireReader.prototype.left = function () { return this.b.length - this.p; };
+WireReader.prototype.u8 = function () { return this.p < this.b.length ? this.b[this.p++] & 0xff : 0; };
+WireReader.prototype.i8 = function () { const v = this.u8(); return v >= 128 ? v - 256 : v; };
+WireReader.prototype.var = function () {
+	let shift = 0, out = 0;
+	while (this.left() > 0) {
+		const byte = this.u8();
+		out |= (byte & 0x7f) << shift;
+		if (!(byte & 0x80)) break;
+		shift += 7;
+		if (shift > 35) break;
+	}
+	return out >>> 0;
+};
+WireReader.prototype.zig = function () { const v = this.var(); return (v >>> 1) ^ -(v & 1); };
+WireReader.prototype.str = function () {
+	const code = this.u8();
+	if (code === 0) return '';
+	if (code < 128) return WIRE_STR_DICT[code - 1] || '';
+	if (code === 128) {
+		const len = Math.min(this.var(), this.left());
+		let s = '';
+		for (let i = 0; i < len; i++) s += String.fromCharCode(this.u8());
+		try { return decodeURIComponent(escape(s)); } catch (e) { return s; }
+	}
+	return '';
+};
+
+// ---- 'c' (标准) binary body codecs — field order matches the client exactly ----
+function wireEncCPlayerState(o) {
+	const w = new WireWriter();
+	const flags1 = (o.dead ? 1 : 0) | (o.cg ? 2 : 0) | (o.fl ? 4 : 0) | (o.cs ? 8 : 0)
+		| (o.al ? 16 : 0) | (o.gd ? 32 : 0)
+		// hasXa is PRESENCE-based: an explicit empty string is the "extern anim
+		// CLEARED" signal in the legacy format and must materialize on decode.
+		| ((o.xa !== undefined || o.xf !== undefined) ? 64 : 0)
+		// hasCl is presence-based too — cl:'' (unknown class) must materialize.
+		| (o.cl !== undefined ? 128 : 0);
+	w.u8(flags1);
+	// Presence bits keep the decode EXACTLY as sparse as the legacy JSON (a
+	// field absent on the wire stays absent after decoding — receivers' presence
+	// guards + caches must never see a default-0 overwrite, e.g. from the town
+	// light packet that omits the whole stats/guard block).
+	const hasStats = typeof o.hp === 'number';
+	const hasGuard = o.gd !== undefined || o.gst !== undefined || o.gws !== undefined
+		|| o.gw !== undefined || o.gm !== undefined || o.ga !== undefined
+		|| o.def !== undefined || o.fc !== undefined;
+	const ef = Array.isArray(o.ef) ? o.ef : null;
+	const st = Array.isArray(o.st) ? o.st : null;
+	const anchor = !!(o.cax || o.cay || o.caz);
+	w.u8((anchor ? 1 : 0) | (st ? 2 : 0) | (hasStats ? 4 : 0) | (hasGuard ? 8 : 0)
+		| (ef ? 16 : 0) | (typeof o.df === 'number' ? 32 : 0) | (typeof o.ggt === 'number' ? 64 : 0));
+	const pos = o.pos || {};
+	w.zig(pos.x || 0); w.zig(pos.y || 0); w.zig(pos.z || 0);
+	const f = o.face || {};
+	w.i8(Math.round((f.x || 0) * 100)); w.i8(Math.round((f.y || 0) * 100));
+	w.str(o.anim || '');
+	if (flags1 & 64) { w.str(o.xa || ''); w.str(o.xf || ''); }
+	if (hasStats) {
+		w.var(o.hp || 0); w.var(o.maxHp || 0); w.var(o.sp || 0); w.var(o.maxSp || 0);
+		w.u8c(o.em || 0, 0, 4);
+	}
+	if (flags1 & 128) w.str(o.cl || '');
+	if (flags1 & 16) {
+		w.i8(Math.round((o.ax || 0) * 100)); w.i8(Math.round((o.ay || 0) * 100));
+		if (anchor) { w.zig(Math.round(o.cax || 0)); w.zig(Math.round(o.cay || 0)); w.zig(Math.round(o.caz || 0)); }
+	}
+	if (hasGuard) {
+		w.u8c((o.gst || 0) * 100, 0, 255);
+		w.u8c((o.gws || 0) * 100, 0, 255);
+		w.i8(Math.round((o.gw || 0) * 100)); w.i8(Math.round((o.gm || 0) * 100)); w.i8(Math.round((o.ga || 0) * 100));
+		w.var(o.def || 0); w.var(o.fc || 0);
+	}
+	if (ef) for (let i = 0; i < 4; i++) w.u8c((ef[i] || 0) * 50, 0, 255);
+	if (typeof o.df === 'number') w.u8c((o.df == null ? 1 : o.df) * 50, 0, 255);
+	if (st) for (let i = 0; i < 5; i++) w.u8c(st[i] || 0, 0, 255);
+	if (typeof o.ggt === 'number') w.var(o.ggt || 0);
+	return w.out();
+}
+function wireDecCPlayerState(r) {
+	const flags1 = r.u8();
+	const flags2 = r.u8();
+	const out = {
+		dead: (flags1 & 1) ? 1 : 0, cg: (flags1 & 2) ? 1 : 0, fl: (flags1 & 4) ? 1 : 0,
+		cs: (flags1 & 8) ? 1 : 0, al: (flags1 & 16) ? 1 : 0, gd: (flags1 & 32) ? 1 : 0,
+		pos: { x: r.zig(), y: r.zig(), z: r.zig() },
+		face: { x: r.i8() / 100, y: r.i8() / 100 },
+		anim: r.str(),
+	};
+	if (flags1 & 64) { out.xa = r.str(); out.xf = r.str(); }
+	if (flags2 & 4) {
+		out.hp = r.var(); out.maxHp = r.var(); out.sp = r.var(); out.maxSp = r.var();
+		out.em = r.u8();
+	}
+	if (flags1 & 128) out.cl = r.str();
+	if (flags1 & 16) {
+		out.ax = r.i8() / 100; out.ay = r.i8() / 100;
+		if (flags2 & 1) { out.cax = r.zig(); out.cay = r.zig(); out.caz = r.zig(); }
+	}
+	if (flags2 & 8) {
+		out.gst = r.u8() / 100;
+		out.gws = r.u8() / 100;
+		out.gw = r.i8() / 100; out.gm = r.i8() / 100; out.ga = r.i8() / 100;
+		out.def = r.var(); out.fc = r.var();
+	}
+	if (flags2 & 16) out.ef = [r.u8() / 50, r.u8() / 50, r.u8() / 50, r.u8() / 50];
+	if (flags2 & 32) out.df = r.u8() / 50;
+	if (flags2 & 2) out.st = [r.u8(), r.u8(), r.u8(), r.u8(), r.u8()];
+	if (flags2 & 64) out.ggt = r.var();
+	return out;
+}
+function wireEncCPlayerStats(o) {
+	const w = new WireWriter();
+	// Presence-based bits: em:0 (neutral element) and el:0 (empty bar) are REAL
+	// states and must materialize — only a truly absent field stays absent.
+	w.u8((o.ov ? 1 : 0) | (o.el !== undefined ? 2 : 0) | (o.em !== undefined ? 4 : 0));
+	w.var(o.hp || 0); w.var(o.maxHp || 0); w.var(o.sp || 0); w.var(o.maxSp || 0);
+	if (o.em !== undefined) w.u8c(o.em, 0, 4);
+	if (o.el !== undefined) w.u8c(o.el * 20, 0, 255);
+	return w.out();
+}
+function wireDecCPlayerStats(r) {
+	const flags = r.u8();
+	const out = { hp: r.var(), maxHp: r.var(), sp: r.var(), maxSp: r.var() };
+	if (flags & 4) out.em = r.u8();
+	if (flags & 2) out.el = r.u8() / 20;
+	// ov only materializes when SET (the legacy whitelist drops false), so a
+	// receiver's overload cache never sees a spurious false overwrite.
+	if (flags & 1) out.ov = true;
+	return out;
+}
+function wireEncCBotState(o) {
+	const w = new WireWriter();
+	w.str(o.map || '');
+	const bots = Array.isArray(o.bots) ? o.bots : [];
+	w.u8(Math.min(255, bots.length));
+	for (const b of bots) {
+		w.str((b && b.n) || '');
+		w.zig(b.x || 0); w.zig(b.y || 0);
+		w.u8c(b.z || 0, 0, 255);
+		w.i8(Math.round((b.fx || 0) * 100)); w.i8(Math.round((b.fy || 0) * 100));
+		w.str(b.a || '');
+		w.var(b.hp || 0); w.var(b.mh || 0); w.var(b.lv || 0); w.var(b.ex || 0);
+	}
+	return w.out();
+}
+function wireDecCBotState(r) {
+	const map = r.str();
+	const n = r.u8();
+	const bots = [];
+	for (let i = 0; i < n; i++) {
+		bots.push({
+			n: r.str(),
+			x: r.zig(), y: r.zig(), z: r.u8(),
+			fx: r.i8() / 100, fy: r.i8() / 100,
+			a: r.str(),
+			hp: r.var(), mh: r.var(), lv: r.var(), ex: r.var(),
+		});
+	}
+	return { map: map, bots: bots };
+}
+
+// ---- 'd' (调试) short-key codecs — key tables match the client exactly ----
+const WIRE_PS_KEYS = [
+	['pos', 'p'], ['face', 'f'], ['anim', 'a'], ['xa', 'x'], ['xf', 'X'], ['dead', 'd'],
+	['hp', 'h'], ['maxHp', 'H'], ['sp', 's'], ['maxSp', 'S'], ['cg', 'c'], ['em', 'e'],
+	['cl', 'k'], ['fl', 'l'], ['cs', 'C'], ['al', 'A'], ['ax', 'i'], ['ay', 'j'],
+	['cax', 'I'], ['cay', 'J'], ['caz', 'K'], ['gd', 'g'], ['gst', 't'], ['gws', 'T'],
+	['gw', 'w'], ['gm', 'm'], ['ga', 'G'], ['def', 'D'], ['fc', 'F'], ['ef', 'E'],
+	['df', 'b'], ['st', 'y'], ['ggt', 'q'],
+];
+// D-format omission rule: ONLY fields where 0/''/false is INDISTINGUISHABLE
+// from absence for every consumer (cosmetic flags, aim fields only read while
+// al=1, empty strings). The guard/damage/element/HUD blocks must NEVER be
+// omitted on zero — a legit 0 (guard released, element switched to neutral,
+// empty SP bar) would read as "keep the cached value" and resurrect stale
+// state (the exact ROUND 79 cache bug class).
+const WIRE_PS_OMIT_D = { ax: 1, ay: 1, cax: 1, cay: 1, caz: 1, fl: 1, dead: 1, cs: 1, al: 1 };
+function wireEncDPlayerState(o) {
+	const out = {};
+	for (const pair of WIRE_PS_KEYS) {
+		const v = o[pair[0]];
+		if (v === undefined) continue;
+		if (WIRE_PS_OMIT_D[pair[0]] && (v === 0 || v === '' || v === false)) continue;
+		out[pair[1]] = v;
+	}
+	return out;
+}
+function wireDecDPlayerState(k) {
+	const out = {};
+	for (const pair of WIRE_PS_KEYS) {
+		if (k[pair[1]] !== undefined) out[pair[0]] = k[pair[1]];
+	}
+	return out;
+}
+const WIRE_ST_KEYS = [['hp', 'h'], ['maxHp', 'H'], ['sp', 's'], ['maxSp', 'S'], ['em', 'e'], ['el', 'l'], ['ov', 'o']];
+function wireEncDPlayerStats(o) {
+	const out = {};
+	for (const pair of WIRE_ST_KEYS) {
+		const v = o[pair[0]];
+		if (v === undefined) continue;
+		// ov=false is the ONLY omission (the legacy whitelist drops false too);
+		// em/el zeros are meaningful HUD states and must ride every packet.
+		if (pair[0] === 'ov' && v === false) continue;
+		out[pair[1]] = v;
+	}
+	return out;
+}
+function wireDecDPlayerStats(k) {
+	const out = {};
+	for (const pair of WIRE_ST_KEYS) {
+		if (k[pair[1]] !== undefined) out[pair[0]] = k[pair[1]];
+	}
+	return out;
+}
+const WIRE_BS_KEYS = [
+	['n', 'n'], ['x', 'x'], ['y', 'y'], ['z', 'z'], ['fx', 'u'], ['fy', 'v'], ['a', 'a'],
+	['hp', 'h'], ['mh', 'H'], ['lv', 'L'], ['ex', 'X'],
+];
+function wireEncDBotState(o) {
+	const bots = Array.isArray(o.bots) ? o.bots : [];
+	const outBots = bots.map(function (b) {
+		const nb = {};
+		for (const pair of WIRE_BS_KEYS) {
+			const v = b ? b[pair[0]] : undefined;
+			// Only empty ANIM is omissible — z:0 / fy:0 / lv:0 are real values
+			// the puppet appliers read positionally.
+			if (v === undefined) continue;
+			if (pair[0] === 'a' && v === '') continue;
+			nb[pair[1]] = v;
+		}
+		return nb;
+	});
+	return { m: o.map || '', b: outBots };
+}
+function wireDecDBotState(k) {
+	const bots = Array.isArray(k.b) ? k.b : [];
+	return {
+		map: typeof k.m === 'string' ? k.m : '',
+		bots: bots.map(function (b) {
+			const nb = {};
+			for (const pair of WIRE_BS_KEYS) {
+				if (b && b[pair[1]] !== undefined) nb[pair[0]] = b[pair[1]];
+			}
+			return nb;
+		}),
+	};
+}
+
+// ---- 1.80.x (combat streams): codecs for entityState / playerBall / throwBall /
+// projectileState / enemySound / enemySoundStop. Mirrors wireSchema.ts BYTE FOR
+// BYTE (see the client's layout comment). entityState + playerBall are
+// PRESENCE-faithful to the sender's static/dynamic split; the server merges its
+// own static caches back for LEGACY receivers only (relayEntStaticMerge etc).
+function wireEncCEntityState(o) {
+	const w = new WireWriter();
+	const list = (Array.isArray(o.e) ? o.e : []).filter(function (e) { return e && typeof e === 'object'; });
+	w.var(Math.min(512, list.length));
+	for (const en of list) {
+		w.var(en.i || 0);
+		if (typeof en.x !== 'number') { w.u8(1); continue; } // liveness marker
+		const hasStatic = en.t !== undefined || en.mi !== undefined;
+		const st = Array.isArray(en.st) ? en.st : null;
+		const sh = (en.sh !== undefined && en.sh !== null) ? en.sh : null;
+		w.u8((hasStatic ? 2 : 0) | (en.hd ? 4 : 0) | (en.psv ? 8 : 0) | (en.abs ? 16 : 0)
+			| (en.vul ? 32 : 0) | (en.inv ? 64 : 0) | (en.tg ? 128 : 0));
+		w.u8((en.brk ? 1 : 0) | (en.af ? 2 : 0) | (st ? 4 : 0) | (sh ? 8 : 0)
+			| (en.shp !== undefined ? 16 : 0));
+		if (hasStatic) {
+			w.var(en.mi || 0);
+			w.str(en.t || '');
+			w.var(en.m || 0);
+			w.var(en.msp || 0);
+			w.u8(en.tos ? 1 : 0);
+			const hasAts = en.ats !== undefined, hasNm = en.nm !== undefined, hasMk = en.mk !== undefined;
+			w.u8((hasAts ? 1 : 0) | (hasNm ? 2 : 0) | (hasMk ? 4 : 0));
+			if (hasAts) w.str(en.ats || '');
+			if (hasNm) w.str(en.nm || '');
+			if (hasMk) w.str(en.mk || '');
+		}
+		w.zig(en.x || 0); w.zig(en.y || 0); w.zig(en.z || 0);
+		w.i8(Math.round((en.fx || 0) * 100)); w.i8(Math.round((en.fy || 0) * 100));
+		w.str(en.a || '');
+		w.str(en.ss || '');
+		w.var(en.h || 0);
+		w.var(en.sp || 0);
+		if (en.brp === undefined || en.brp === null) w.u8(255);
+		else w.u8c(en.brp * 100, 0, 254);
+		w.str(en.tn || '');
+		if (st) for (let i = 0; i < 5; i++) w.var(st[i] || 0);
+		if (sh) w.str(JSON.stringify(sh));
+		if (en.shp !== undefined) w.var(en.shp || 0);
+	}
+	return w.out();
+}
+function wireDecCEntityState(r) {
+	const n = r.var();
+	const e = [];
+	for (let k = 0; k < n; k++) {
+		const i = r.var();
+		const ef1 = r.u8();
+		if (ef1 & 1) { e.push({ i: i }); continue; }
+		const ef2 = r.u8();
+		const out = {
+			i: i,
+			hd: (ef1 & 4) ? 1 : 0,
+			psv: (ef1 & 8) ? 1 : 0,
+			abs: (ef1 & 16) ? 1 : 0,
+			vul: (ef1 & 32) ? 1 : 0,
+			inv: (ef1 & 64) ? 1 : 0,
+			tg: (ef1 & 128) ? 1 : 0,
+			brk: (ef2 & 1) ? 1 : 0,
+		};
+		if (ef2 & 2) out.af = 1;
+		if (ef1 & 2) {
+			out.mi = r.var();
+			out.t = r.str();
+			out.m = r.var();
+			out.msp = r.var();
+			out.tos = r.u8();
+			const sfl = r.u8();
+			if (sfl & 1) out.ats = r.str();
+			if (sfl & 2) out.nm = r.str();
+			if (sfl & 4) out.mk = r.str();
+		}
+		out.x = r.zig(); out.y = r.zig(); out.z = r.zig();
+		out.fx = r.i8() / 100; out.fy = r.i8() / 100;
+		out.a = r.str();
+		out.ss = r.str();
+		out.h = r.var();
+		out.sp = r.var();
+		const brpC = r.u8();
+		if (brpC !== 255) out.brp = brpC / 100;
+		out.tn = r.str();
+		if (ef2 & 4) out.st = [r.var(), r.var(), r.var(), r.var(), r.var()];
+		if (ef2 & 8) { try { out.sh = JSON.parse(r.str()); } catch (e2) { /* skip bad shields */ } }
+		if (ef2 & 16) out.shp = r.var();
+		e.push(out);
+	}
+	return { e: e };
+}
+function wireEncCPlayerBall(o) {
+	const w = new WireWriter();
+	const list = (Array.isArray(o.entries) ? o.entries : []).filter(function (e) { return e && typeof e === 'object'; });
+	w.var(Math.min(64, list.length));
+	for (const en of list) {
+		w.var(en.i || 0);
+		const dead = en.dead === 1 || en.dead === true;
+		const hasPn = typeof en.pn === 'string' && en.pn.length > 0;
+		const hasStatic = !dead && (en.el !== undefined || en.chg !== undefined || hasPn);
+		w.u8((dead ? 1 : 0) | (hasStatic ? 2 : 0) | (hasPn ? 4 : 0));
+		if (dead) continue;
+		if (hasStatic) {
+			w.u8c(en.el || 0, 0, 4);
+			w.u8(en.chg ? 1 : 0);
+			if (hasPn) w.str(en.pn || '');
+		}
+		w.zig(en.x || 0); w.zig(en.y || 0); w.zig(en.z || 0);
+		w.zig(en.vx || 0); w.zig(en.vy || 0);
+	}
+	return w.out();
+}
+function wireDecCPlayerBall(r) {
+	const n = r.var();
+	const entries = [];
+	for (let k = 0; k < n; k++) {
+		const i = r.var();
+		const fl = r.u8();
+		if (fl & 1) { entries.push({ i: i, dead: 1 }); continue; }
+		const out = { i: i };
+		if (fl & 2) {
+			out.el = r.u8();
+			out.chg = r.u8();
+		}
+		if (fl & 4) out.pn = r.str();
+		out.x = r.zig(); out.y = r.zig(); out.z = r.zig();
+		out.vx = r.zig(); out.vy = r.zig();
+		entries.push(out);
+	}
+	return { entries: entries };
+}
+function wireEncCThrowBall(o) {
+	const w = new WireWriter();
+	const dir = o.dir || {};
+	const pos = o.pos;
+	const combatantStr = typeof o.combatant === 'string';
+	w.str(o.ballInfo || '');
+	w.u8((pos ? 1 : 0) | (o.bn ? 2 : 0) | (combatantStr ? 4 : 0));
+	if (combatantStr) w.str(o.combatant || '');
+	else w.var(typeof o.combatant === 'number' ? Math.max(0, Math.round(o.combatant)) : 0);
+	w.u8c(o.party || 0, 0, 255);
+	w.i8(Math.round((dir.x || 0) * 100));
+	w.i8(Math.round((dir.y || 0) * 100));
+	if (pos) { w.zig(pos.x || 0); w.zig(pos.y || 0); w.zig(pos.z || 0); }
+	if (o.bn) w.str(o.bn || '');
+	return w.out();
+}
+function wireDecCThrowBall(r) {
+	const out = { ballInfo: r.str() };
+	const fl = r.u8();
+	if (fl & 4) out.combatant = r.str();
+	else out.combatant = r.var();
+	out.party = r.u8();
+	out.dir = { x: r.i8() / 100, y: r.i8() / 100 };
+	if (fl & 1) out.pos = { x: r.zig(), y: r.zig(), z: r.zig() };
+	if (fl & 2) out.bn = r.str();
+	return out;
+}
+function wireEncCProjectileState(o) {
+	const w = new WireWriter();
+	const list = (Array.isArray(o.e) ? o.e : []).filter(function (e) { return e && typeof e === 'object'; });
+	w.var(Math.min(128, list.length));
+	for (const en of list) {
+		w.var(en.i || 0);
+		w.u8(en.k === 'S' ? 1 : (en.k === 'G' ? 2 : 0));
+		w.var(en.src || 0);
+		w.str(en.pn || '');
+		w.zig(en.x || 0); w.zig(en.y || 0); w.zig(en.z || 0);
+		w.zig(en.vx || 0); w.zig(en.vy || 0);
+		w.u8(en.d === 1 || en.d === true ? 1 : 0);
+	}
+	return w.out();
+}
+function wireDecCProjectileState(r) {
+	const n = r.var();
+	const e = [];
+	for (let k = 0; k < n; k++) {
+		e.push({
+			i: r.var(),
+			k: ['B', 'S', 'G'][r.u8()] || 'B',
+			src: r.var(),
+			pn: r.str(),
+			x: r.zig(), y: r.zig(), z: r.zig(),
+			vx: r.zig(), vy: r.zig(),
+			d: r.u8(),
+		});
+	}
+	return { e: e };
+}
+function wireEncCEnemySound(o) {
+	const w = new WireWriter();
+	w.var(o.uid || 0);
+	w.str(o.path || '');
+	w.u8c((o.volume === undefined ? 1 : o.volume) * 100, 0, 100);
+	w.u8c((o.variance || 0) * 100, 0, 100);
+	const hasRadius = typeof o.radius === 'number';
+	const hasSpeed = typeof o.speed === 'number';
+	w.u8((o.loop ? 1 : 0) | (o.global ? 2 : 0) | (hasRadius ? 4 : 0) | (hasSpeed ? 8 : 0));
+	if (hasRadius) w.u8c(o.radius, 0, 255);
+	if (hasSpeed) w.u8c((o.speed === undefined ? 1 : o.speed) * 50, 0, 255);
+	return w.out();
+}
+function wireDecCEnemySound(r) {
+	const out = {
+		uid: r.var(),
+		path: r.str(),
+		volume: r.u8() / 100,
+		variance: r.u8() / 100,
+	};
+	const fl = r.u8();
+	out.loop = !!(fl & 1);
+	out.global = !!(fl & 2);
+	if (fl & 4) out.radius = r.u8();
+	if (fl & 8) out.speed = r.u8() / 50;
+	return out;
+}
+function wireEncCEnemySoundStop(o) {
+	const w = new WireWriter();
+	w.var(o.uid || 0);
+	return w.out();
+}
+function wireDecCEnemySoundStop(r) {
+	return { uid: r.var() };
+}
+
+// ---- combat 'd' (调试) short-key tables (match the client exactly) ----
+const WIRE_ENT_KEYS = [
+	['i', 'i'], ['mi', 'M'], ['t', 'T'], ['x', 'x'], ['y', 'y'], ['z', 'z'],
+	['fx', 'f'], ['fy', 'F'], ['a', 'a'], ['ss', 'C'], ['h', 'h'], ['m', 'm'],
+	['tg', 'g'], ['tn', 'n'], ['sp', 'p'], ['msp', 'P'], ['brk', 'b'], ['brp', 'B'],
+	['hd', 'd'], ['psv', 'S'], ['abs', 'X'], ['vul', 'V'], ['inv', 'c'], ['tos', 'O'],
+	['nm', 'q'], ['ats', 'R'], ['st', 'w'], ['sh', 'W'], ['shp', 'Y'], ['mk', 'K'], ['af', 'j'],
+];
+function wireEncDEntityState(o) {
+	const list = (Array.isArray(o.e) ? o.e : []).filter(function (e) { return e && typeof e === 'object'; });
+	return {
+		e: list.map(function (en) {
+			const out = {};
+			for (const pair of WIRE_ENT_KEYS) {
+				if (en[pair[0]] !== undefined) out[pair[1]] = en[pair[0]];
+			}
+			return out;
+		}),
+	};
+}
+function wireDecDEntityState(k) {
+	const list = Array.isArray(k && k.e) ? k.e : [];
+	return list.map(function (en) {
+		const out = {};
+		for (const pair of WIRE_ENT_KEYS) {
+			if (en && en[pair[1]] !== undefined) out[pair[0]] = en[pair[1]];
+		}
+		return out;
+	});
+}
+const WIRE_PB_KEYS = [
+	['i', 'i'], ['el', 'e'], ['chg', 'c'], ['pn', 'p'], ['x', 'x'], ['y', 'y'], ['z', 'z'],
+	['vx', 'X'], ['vy', 'Y'], ['dead', 'd'],
+];
+function wireEncDPlayerBall(o) {
+	const list = (Array.isArray(o.entries) ? o.entries : []).filter(function (e) { return e && typeof e === 'object'; });
+	return {
+		e: list.map(function (en) {
+			const out = {};
+			for (const pair of WIRE_PB_KEYS) {
+				if (en[pair[0]] !== undefined) out[pair[1]] = en[pair[0]];
+			}
+			return out;
+		}),
+	};
+}
+function wireDecDPlayerBall(k) {
+	const list = Array.isArray(k && k.e) ? k.e : [];
+	return list.map(function (en) {
+		const out = {};
+		for (const pair of WIRE_PB_KEYS) {
+			if (en && en[pair[1]] !== undefined) out[pair[0]] = en[pair[1]];
+		}
+		return out;
+	});
+}
+const WIRE_TB_KEYS = [
+	['ballInfo', 'b'], ['combatant', 'c'], ['party', 'p'], ['pos', 'P'], ['bn', 'n'],
+];
+function wireEncDThrowBall(o) {
+	const out = {};
+	for (const pair of WIRE_TB_KEYS) {
+		if (o[pair[0]] !== undefined) out[pair[1]] = o[pair[0]];
+	}
+	if (o.dir !== undefined) out.d = o.dir;
+	return out;
+}
+function wireDecDThrowBall(k) {
+	const out = {};
+	for (const pair of WIRE_TB_KEYS) {
+		if (k[pair[1]] !== undefined) out[pair[0]] = k[pair[1]];
+	}
+	if (k.d !== undefined) out.dir = k.d;
+	return out;
+}
+const WIRE_PRJ_KEYS = [
+	['i', 'i'], ['k', 'k'], ['src', 's'], ['pn', 'p'], ['x', 'x'], ['y', 'y'], ['z', 'z'],
+	['vx', 'X'], ['vy', 'Y'], ['d', 'd'],
+];
+function wireEncDProjectileState(o) {
+	const list = (Array.isArray(o.e) ? o.e : []).filter(function (e) { return e && typeof e === 'object'; });
+	return {
+		e: list.map(function (en) {
+			const out = {};
+			for (const pair of WIRE_PRJ_KEYS) {
+				if (en[pair[0]] !== undefined) out[pair[1]] = en[pair[0]];
+			}
+			return out;
+		}),
+	};
+}
+function wireDecDProjectileState(k) {
+	const list = Array.isArray(k && k.e) ? k.e : [];
+	return list.map(function (en) {
+		const out = {};
+		for (const pair of WIRE_PRJ_KEYS) {
+			if (en && en[pair[1]] !== undefined) out[pair[0]] = en[pair[1]];
+		}
+		return out;
+	});
+}
+const WIRE_ES_KEYS = [
+	['uid', 'u'], ['path', 'p'], ['volume', 'v'], ['variance', 'x'], ['loop', 'l'],
+	['global', 'g'], ['radius', 'r'], ['speed', 's'],
+];
+function wireEncDEnemySound(o) {
+	const out = {};
+	for (const pair of WIRE_ES_KEYS) {
+		if (o[pair[0]] !== undefined) out[pair[1]] = o[pair[0]];
+	}
+	return out;
+}
+function wireDecDEnemySound(k) {
+	const out = {};
+	for (const pair of WIRE_ES_KEYS) {
+		if (k[pair[1]] !== undefined) out[pair[0]] = k[pair[1]];
+	}
+	return out;
+}
+
+// ---- 1.80.x: server-side static caches for the split streams ----
+// Keyed by sender name (the host / the ball owner). entityState: uid -> the 8
+// static fields; playerBall: uid -> {el, chg, pn}. Used ONLY when re-encoding
+// for a LEGACY receiver (old clients can't merge themselves); c/d receivers
+// keep their own per-uid caches (self-healed by the 1s force-full heartbeat).
+// Bounded + cleared on the sender's logout so a host rotation starts fresh.
+const ENT_STATIC_FIELDS = ['mi', 't', 'm', 'msp', 'tos', 'ats', 'nm', 'mk'];
+const relayEntStatic = new Map();   // sender -> Map(uid -> static fields)
+const relayBallStatic = new Map();  // sender -> Map(uid -> {el, chg, pn})
+function entStaticOf(sender) {
+	let m = relayEntStatic.get(sender);
+	if (!m) { m = new Map(); relayEntStatic.set(sender, m); }
+	return m;
+}
+function ballStaticOf(sender) {
+	let m = relayBallStatic.get(sender);
+	if (!m) { m = new Map(); relayBallStatic.set(sender, m); }
+	return m;
+}
+/** Absorb an inbound canonical entityState block into the sender's static cache
+ * (full entries only). FIFO-capped so a long session can't grow it unbounded. */
+function entStaticAbsorb(sender, canonical) {
+	try {
+		if (!canonical || !Array.isArray(canonical.e)) return;
+		const m = entStaticOf(sender);
+		for (const en of canonical.e) {
+			if (!en || typeof en !== 'object' || en.t === undefined) continue;
+			const st = {};
+			for (const f of ENT_STATIC_FIELDS) st[f] = en[f];
+			m.set(en.i, st);
+		}
+		while (m.size > 1024) m.delete(m.keys().next().value);
+	} catch (e) { /* never break the relay */ }
+}
+/** Merge the cached static fields back into dynamic-only entries (legacy receivers). */
+function entStaticMerge(sender, canonical) {
+	try {
+		const m = relayEntStatic.get(sender);
+		if (!m || !canonical || !Array.isArray(canonical.e)) return canonical;
+		for (const en of canonical.e) {
+			if (!en || typeof en !== 'object' || en.t !== undefined) continue;
+			const st = m.get(en.i);
+			if (st) Object.assign(en, st);
+		}
+		return canonical;
+	} catch (e) { return canonical; }
+}
+/** Merge the cached playerBall static fields back into follow-up entries
+ * (legacy receivers; the handler itself absorbs + prunes the cache). */
+function ballStaticMerge(sender, canonical) {
+	try {
+		const m = relayBallStatic.get(sender);
+		if (!m || !canonical || !Array.isArray(canonical.entries)) return canonical;
+		for (const en of canonical.entries) {
+			if (!en || typeof en !== 'object' || en.dead === 1) continue;
+			if (en.el !== undefined) continue;
+			const st = m.get(en.i);
+			if (st) {
+				if (st.el !== undefined) en.el = st.el;
+				if (st.chg !== undefined) en.chg = st.chg;
+				if (st.pn !== undefined) en.pn = st.pn;
+			}
+		}
+		return canonical;
+	} catch (e) { return canonical; }
+}
+
+// ---- inbound decode / outbound encode / per-receiver relay ----
+function wireIsBinary(v) {
+	if (!v || typeof v !== 'object') return false;
+	return Buffer.isBuffer(v) || v instanceof Uint8Array || v instanceof ArrayBuffer;
+}
+/** Decode ANY inbound hot-stream format into the canonical long-key shape.
+ * Returns null on a decode failure (caller drops the packet). */
+function wireDecodeHot(event, data) {
+	if (!data || typeof data !== 'object') return data;
+	try {
+		if (wireIsBinary(data.d)) {
+			const r = new WireReader(data.d instanceof ArrayBuffer ? new Uint8Array(data.d) : data.d);
+			let body = null;
+			if (event === 'entityState') body = wireDecCEntityState(r);
+			else if (event === 'playerBall') body = wireDecCPlayerBall(r);
+			else if (event === 'projectileState') body = wireDecCProjectileState(r);
+			else if (event === 'throwBall') return wireDecCThrowBall(r);
+			else if (event === 'enemySound') return wireDecCEnemySound(r);
+			else if (event === 'enemySoundStop') return wireDecCEnemySoundStop(r);
+			else if (event === 'playerState') body = wireDecCPlayerState(r);
+			else if (event === 'updatePlayerStats') body = wireDecCPlayerStats(r);
+			else body = wireDecCBotState(r);
+			return Object.assign({}, data, body);
+		}
+		if (data.k && typeof data.k === 'object' && !Array.isArray(data.k)) {
+			if (event === 'entityState') {
+				return {
+					map: typeof data.m === 'string' ? data.m : '',
+					cb: data.c === 1,
+					f: data.f === 1 ? 1 : undefined,
+					st: (data.s === 'B' || data.s === 'H') ? data.s : undefined,
+					e: wireDecDEntityState(data.k),
+				};
+			}
+			if (event === 'playerBall') {
+				return {
+					from: data.from,
+					map: typeof data.m === 'string' ? data.m : '',
+					entries: wireDecDPlayerBall(data.k),
+				};
+			}
+			if (event === 'projectileState') {
+				return { map: typeof data.m === 'string' ? data.m : '', e: wireDecDProjectileState(data.k) };
+			}
+			if (event === 'throwBall') return wireDecDThrowBall(data.k);
+			if (event === 'enemySound') return wireDecDEnemySound(data.k);
+			if (event === 'enemySoundStop') {
+				const out = {};
+				if (data.k.u !== undefined) out.uid = data.k.u;
+				return out;
+			}
+			const body = event === 'playerState' ? wireDecDPlayerState(data.k)
+				: event === 'updatePlayerStats' ? wireDecDPlayerStats(data.k)
+					: wireDecDBotState(data.k);
+			return Object.assign({}, data, body);
+		}
+	} catch (e) {
+		return null;
+	}
+	return data;
+}
+/** Encode the CANONICAL relay payload in the requested schema (wrapper keeps
+ * player/from/map — and entityState's cb/f/st — as JSON; the body becomes a
+ * binary attachment or short keys). */
+function wireEncodeHot(event, mode, canonical) {
+	const wrap = {};
+	const bin = mode === 'c';
+	if (event === 'entityState') {
+		if (bin) {
+			wrap.map = canonical.map;
+			if (canonical.cb) wrap.cb = true;
+			if (canonical.f === 1) wrap.f = 1;
+			if (canonical.st === 'B' || canonical.st === 'H') wrap.st = canonical.st;
+			wrap.d = wireEncCEntityState(canonical);
+		} else {
+			wrap.m = canonical.map;
+			if (canonical.cb) wrap.c = 1;
+			if (canonical.f === 1) wrap.f = 1;
+			if (canonical.st === 'B' || canonical.st === 'H') wrap.s = canonical.st;
+			wrap.k = wireEncDEntityState(canonical);
+		}
+	} else if (event === 'playerBall') {
+		if (canonical.from !== undefined) wrap.from = canonical.from;
+		if (bin) { wrap.map = canonical.map; wrap.d = wireEncCPlayerBall(canonical); }
+		else { wrap.m = canonical.map; wrap.k = wireEncDPlayerBall(canonical); }
+	} else if (event === 'projectileState') {
+		if (bin) { wrap.map = canonical.map; wrap.d = wireEncCProjectileState(canonical); }
+		else { wrap.m = canonical.map; wrap.k = wireEncDProjectileState(canonical); }
+	} else if (event === 'throwBall') {
+		if (bin) wrap.d = wireEncCThrowBall(canonical);
+		else wrap.k = wireEncDThrowBall(canonical);
+	} else if (event === 'enemySound') {
+		if (bin) wrap.d = wireEncCEnemySound(canonical);
+		else wrap.k = wireEncDEnemySound(canonical);
+	} else if (event === 'enemySoundStop') {
+		if (bin) wrap.d = wireEncCEnemySoundStop(canonical);
+		else wrap.k = { u: canonical.uid || 0 };
+	} else {
+		if (canonical.player !== undefined) wrap.player = canonical.player;
+		if (canonical.from !== undefined) wrap.from = canonical.from;
+		if (event === 'botState' && canonical.map !== undefined) wrap.map = canonical.map;
+		if (event === 'playerState') wrap[bin ? 'd' : 'k'] = bin ? wireEncCPlayerState(canonical) : wireEncDPlayerState(canonical);
+		else if (event === 'updatePlayerStats') wrap[bin ? 'd' : 'k'] = bin ? wireEncCPlayerStats(canonical) : wireEncDPlayerStats(canonical);
+		else wrap[bin ? 'd' : 'k'] = bin ? wireEncCBotState(canonical) : wireEncDBotState(canonical);
+	}
+	return wrap;
+}
+/** Schema-aware relay: every RECEIVER gets the canonical payload re-encoded in
+ * THEIR party's effective schema (legacy = long-key JSON as-is, for old
+ * clients). `hostOnly` mirrors broadcastHostState (no-op unless the sender is
+ * the instance host) — entityState/projectileState/enemySound* route through
+ * it. The split streams merge the server's static caches back for LEGACY
+ * receivers only (c/d receivers keep their own per-uid caches, self-healed by
+ * the sender's 1s force-full heartbeat). */
+function relayHotStream(ctxObj, sender, event, canonical, hostOnly) {
+	const instanceId = world.userInstance[sender];
+	if (!instanceId) return;
+	if (hostOnly && !world.isHostOf(sender, instanceId)) return;
+	const inst = world.instances[instanceId];
+	if (!inst) return;
+	let legacyPayload = null;
+	for (const other of inst.members) {
+		if (other === sender) continue;
+		const sock = ctxObj.getSocket(other);
+		if (!sock) continue;
+		const mode = netSchemaFor(other);
+		try {
+			if (mode === 'legacy') {
+				// Legacy merge is LAZY (only when a legacy receiver exists) and done
+				// ONCE per relay, on a DEEP COPY — the merged static fields must
+				// never leak back into the canonical object the c/d encoders see.
+				if (legacyPayload === null) {
+					legacyPayload = canonical;
+					if (event === 'entityState' || event === 'playerBall') {
+						legacyPayload = JSON.parse(JSON.stringify(canonical));
+						if (event === 'entityState') entStaticMerge(sender, legacyPayload);
+						else ballStaticMerge(sender, legacyPayload);
+					}
+				}
+				sock.emit(event, legacyPayload);
+			} else {
+				sock.emit(event, wireEncodeHot(event, mode, canonical));
+			}
+		} catch (e) { /* one bad receiver never breaks the relay */ }
 	}
 }
 
@@ -164,6 +1088,35 @@ function handleConnection(socket) {
 		return e.n > maxPerSec;
 	}
 
+	// 1.79.x (bandwidth): per-sender relay throttle for the three hot streams
+	// (playerState / updatePlayerStats / botState). The cap follows the sender's
+	// CURRENT area type (town = relayMaxTickTown, everything else =
+	// relayMaxTickField), tracked from changeMap. `key` names the per-socket
+	// last-relay timestamp so each stream keeps an independent window. A dropped
+	// packet self-heals: the sender's edge-gated streams re-send on the next
+	// change or the self-heal heartbeat.
+	function relayThrottled(key) {
+		const hz = (socket._mpAreaType === 0) ? config.relayMaxTickTown : config.relayMaxTickField;
+		const now = Date.now();
+		if (socket[key] && now - socket[key] < 1000 / hz) return true;
+		socket[key] = now;
+		return false;
+	}
+
+	// 1.80.x (combat streams): FIXED-rate relay window — unlike relayThrottled it
+	// never follows the sender's current area. The combat relays use the field
+	// cap (combat only happens on paths/dungeons), and entityState's idle 'B'
+	// stream uses the town cap — exactly the rates the new clients align their
+	// send cadence to (min(server cap, hostTickRate option)), so legit traffic is
+	// never clipped while a flooding/buggy client still is.
+	function relayThrottledHz(key, hz) {
+		const now = Date.now();
+		if (socket[key] && now - socket[key] < 1000 / hz) return true;
+		socket[key] = now;
+		return false;
+	}
+	function relayFieldThrottled(key) { return relayThrottledHz(key, config.relayMaxTickField); }
+
 	// ---- round 16: ping echo (client RTT measurement) ----
 	// Intentionally NOT auth-gated: the client pings as soon as the socket exists
 	// to measure handshake/RTT latency. Echo the received payload verbatim back to
@@ -209,6 +1162,11 @@ function handleConnection(socket) {
 		if (!Number.isInteger(t) || !Number.isInteger(seq)) return;
 		if (t < 0 || t > 0xffffffffffff) return; // sane timestamp window
 		if (seq < 0 || seq > 0xffffffff) return; // seq is a client counter, small
+		// 1.80.x (idle kick): `ia` = "the player produced real keyboard/mouse input
+		// since the previous ping" (client-side raw input hooks). Advancing the AFK
+		// clock here means game events (being hit / dying / cutscenes) can NEVER
+		// keep an idle player online — only input does. Old clients never send it.
+		if (data && data.ia) socket._mpLastActive = Date.now();
 		socket.emit('netPong', { t, seq });
 	});
 
@@ -537,6 +1495,9 @@ function handleConnection(socket) {
 			return;
 		}
 		socket._mpVersion = clientVersion;
+		// 1.79.x (bandwidth): the client's wire-schema preference ('c' = 标准
+		// binary, 'd' = 调试 short-key JSON). Absent = old client -> legacy JSON.
+		socket._mpSchemaPref = (data && (data.schema === 'c' || data.schema === 'd')) ? data.schema : null;
 		const name = data && data.username;
 		if (!name) {
 			socket.emit('handshakeResponse', { failed: 'No username given' });
@@ -599,7 +1560,25 @@ function handleConnection(socket) {
 			accounts.clearLoginState(name);
 		}
 
+		// 1.80.x (capacity): server-full gate. A player already online under this
+		// name (own reconnect) is already inside the count and must not be blocked
+		// by their own slot; brand-new logins are rejected once maxPlayers is
+		// reached. Same DISCONNECT-packet pattern as the version gate so a full
+		// server never produces infinite reconnect loops.
+		if (!isReconnect && !accounts.isOnline(name) && accounts.onlineNames().length >= config.maxPlayers) {
+			console.log('[protocol] rejected login for ' + name + ' (server full: ' + accounts.onlineNames().length + '/' + config.maxPlayers + ')');
+			socket.emit('handshakeResponse', {
+				failed: '服务器已满 Server full (' + accounts.onlineNames().length + '/' + config.maxPlayers + ')，请稍后再试',
+				serverFull: true,
+			});
+			setTimeout(function () { try { socket.disconnect(false); } catch (e) { /* ignore */ } }, 50);
+			return;
+		}
+
 		username = name;
+		// 1.80.x (idle kick): the AFK clock starts at auth; only real input
+		// (netPing ia flags) advances it afterwards.
+		socket._mpLastActive = Date.now();
 		const { isNew } = accounts.login(name, socket);
 		if (!isReconnect) {
 			console.log('[protocol] ' + name + ' logged in (v' + config.version + ')' + (isNew ? ' (new account)' : ''));
@@ -681,6 +1660,19 @@ function handleConnection(socket) {
 			// lowercase dotted form by config.js). The client gates teleports to
 			// these maps at INTENT so a blocked map is never loaded at all.
 			blockedMaps: config.blockedMaps,
+			// 1.79.x (bandwidth): relay caps by area type + the self-heal heartbeat
+			// rate — clients align their send floors and heartbeats to these.
+			// netSchema = the player's party-effective wire schema right now.
+			relayMaxTickField: config.relayMaxTickField,
+			relayMaxTickTown: config.relayMaxTickTown,
+			healHz: config.healHz,
+			netSchema: netSchemaFor(name),
+			// 1.80.x (idle kick): AFK auto-disconnect limits in MINUTES per area
+			// type (0 = that area never auto-disconnects). The client enforces the
+			// graceful path (toast + back to title); the server's watchdog is the
+			// backstop against patched clients.
+			afkField: config.afkFieldMinutes,
+			afkTown: config.afkTownMinutes,
 			// Round 17: the accepted server version (harmless; useful for logs — the
 			// client already sent its own version in the handshake payload).
 			version: config.version,
@@ -766,7 +1758,14 @@ function handleConnection(socket) {
 		// world.disconnect migrates the INSTANCE host if this player held it
 		// (setHost to the next member) — survivors stay where they stand.
 		world.disconnect(ctx, name);
+		// 1.80.x: drop the leaver's split-stream static caches (a later host
+		// rotation or relogin must start from the next force-full block).
+		relayEntStatic.delete(name);
+		relayBallStatic.delete(name);
 		const updated = party.removeMember(name);
+		// 1.79.x: the leaver is gone — recompute the survivors' wire schema (an
+		// old-build or 调试-preferring member leaving can flip c/d/legacy).
+		try { netSchemaRecomputeFor(name); } catch (e) { /* non-fatal */ }
 		if (updated) {
 			// Round 12: a leader going offline NO LONGER disbands the party and NO
 			// LONGER teleports survivors to a town (that yanked members out of the
@@ -813,6 +1812,10 @@ function handleConnection(socket) {
 			socket.emit('changeMapResponse', { failed: 'bad areaType' });
 			return;
 		}
+		// 1.79.x (bandwidth): remember the sender's area type (0 = shared town)
+		// so relayThrottled can pick the town vs field relay cap for the three
+		// hot streams.
+		socket._mpAreaType = areaType;
 		// 1.78.x (progress wall): refuse routing into a server-blocked map. The
 		// client's teleport gate normally cancels these BEFORE any request; this
 		// is the authoritative backstop (stale/edited client). The client's veto
@@ -870,12 +1873,17 @@ function handleConnection(socket) {
 	// one (the next accepted packet carries fresh state anyway, so no staleness).
 	socket.on('playerState', function (s) {
 		if (dropIfNotAuthed('playerState')) return;
+		// 1.79.x: decode 标准/调试 wire formats into the canonical long-key shape
+		// (legacy objects pass through; a failed decode drops the packet).
+		s = wireDecodeHot('playerState', s);
 		if (!s || !isValidPos(s.pos)) return;
-		const now = Date.now();
-		if (socket._mpLastPlayerStateRelay && now - socket._mpLastPlayerStateRelay < 40) return;
-		socket._mpLastPlayerStateRelay = now;
+		// 1.79.x: config-driven per-area relay cap (field/town relayMaxTick*).
+		// Replaces the old hard-coded 40ms window.
+		if (relayThrottled('_mpLastPlayerStateRelay')) return;
 		world.updateMemberPos(username, s.pos);
-		world.broadcastToInstance(ctx, username, 'playerState', {
+		// 1.79.x: build the canonical payload once; relayHotStream re-encodes it
+		// per RECEIVER in their party's effective schema (legacy for old clients).
+		relayHotStream(ctx, username, 'playerState', {
 			player: username, pos: s.pos, face: s.face, anim: s.anim,
 			// 1.71.0: extern animations (sit/pose). Bounded strings, omitted below.
 			xa: (typeof s.xa === 'string' && s.xa.length <= 96) ? s.xa : '',
@@ -991,16 +1999,29 @@ function handleConnection(socket) {
 	// it to puppet mirrors (their local enemy AI is disabled).
 	socket.on('entityState', function (block) {
 		if (dropIfNotAuthed('entityState')) return;
-		if (!block || typeof block.map !== 'string' || !Array.isArray(block.e)) return;
-		if (block.e.length > 512) return; // sanity cap
+		// 1.80.x (combat streams): decode ANY wire format into canonical FIRST —
+		// encoded payloads carry the entries in d/k, not in a JSON `e` array.
+		// The canonical block then keeps today's exact long-key shape.
+		const can = wireDecodeHot('entityState', block);
+		if (!can || typeof can.map !== 'string' || !Array.isArray(can.e)) return;
+		if (can.e.length > 512) return; // sanity cap
 		// Round 24: f:1 marks a force-FULL block (the ~1s heartbeat). Whitelisted so it
 		// survives relay — members count full-flagged blocks to learn the host's roster.
 		// ROUND 81: st tags which host stream the block belongs to ('B' = fixed base /
 		// idle enemies, 'H' = option-driven hostile / engaged enemies) so members can
 		// measure the REAL per-stream tick for the network debug HUD.
-		const f = block.f === 1 ? 1 : undefined;
-		const st = block.st === 'B' ? 'B' : (block.st === 'H' ? 'H' : undefined);
-		world.broadcastHostState(ctx, username, 'entityState', { map: block.map, e: block.e, cb: !!block.cb, f, st });
+		const st = can.st === 'B' ? 'B' : (can.st === 'H' ? 'H' : undefined);
+		// 1.80.x (combat caps): per-STREAM fixed relay windows — the hostile 'H'
+		// stream rides the field cap, the idle 'B' stream the town cap. The new
+		// clients send at min(cap, hostTickRate), so these never clip legit
+		// traffic; OLD clients' fixed 15Hz base stream gets clipped to the town
+		// cap (10 by default), which idle enemies tolerate fine.
+		if (relayThrottledHz(st === 'B' ? '_mpEntRelayB' : '_mpEntRelayH',
+			st === 'B' ? config.relayMaxTickTown : config.relayMaxTickField)) return;
+		const canonical = { map: can.map, e: can.e, cb: !!can.cb, f: can.f === 1 ? 1 : undefined, st };
+		// Absorb full entries into the sender's static cache (legacy-merge source).
+		entStaticAbsorb(username, canonical);
+		relayHotStream(ctx, username, 'entityState', canonical, true);
 	});
 
 	// ---- round 62: host streams enemy PROJECTILES so members see ranged attacks ----
@@ -1014,14 +2035,15 @@ function handleConnection(socket) {
 	// (never a raw blob).
 	socket.on('projectileState', function (block) {
 		if (dropIfNotAuthed('projectileState')) return;
-		// Max legit rate = the host's 怪物同步频率 (30/60Hz); 90/s leaves jitter headroom
-		// while still capping floods. (The sibling entityState stream is unlimited.)
-		if (rateLimited('projectileState', 90)) return;
-		if (!block || typeof block.map !== 'string' || !Array.isArray(block.e)) return;
-		if (block.e.length > 128) return; // projectiles are short-lived; the cap is generous
+		// 1.80.x (combat caps): field-cap relay window (replaces the old 90/s
+		// anti-flood counter — the window is the stricter, aligned limit).
+		if (relayFieldThrottled('_mpLastProjRelay')) return;
+		const can = wireDecodeHot('projectileState', block);
+		if (!can || typeof can.map !== 'string' || !Array.isArray(can.e)) return;
+		if (can.e.length > 128) return; // projectiles are short-lived; the cap is generous
 		const num = (v) => (typeof v === 'number' && isFinite(v)) ? Math.round(v) : 0;
 		const list = [];
-		for (const e of block.e) {
+		for (const e of can.e) {
 			if (!e || typeof e !== 'object' || typeof e.i !== 'number') continue;
 			list.push({
 				i: num(e.i),
@@ -1037,7 +2059,7 @@ function handleConnection(socket) {
 				d: e.d === 1 ? 1 : 0,
 			});
 		}
-		world.broadcastHostState(ctx, username, 'projectileState', { map: block.map, e: list });
+		relayHotStream(ctx, username, 'projectileState', { map: can.map, e: list }, true);
 	});
 
 	// ---- round 19: cutscene-spawned monster sync (NON-host streaming) ----
@@ -1090,19 +2112,20 @@ function handleConnection(socket) {
 	// auth-gated + rate-limited; the payload is whitelisted field-by-field (never a raw blob).
 	socket.on('enemySound', function (data) {
 		if (dropIfNotAuthed('enemySound')) return;
-		if (rateLimited('enemySound', 60)) return;
-		if (!data || typeof data.uid !== 'number' || !Number.isInteger(data.uid) || data.uid <= 0) return;
-		if (typeof data.path !== 'string' || !data.path || data.path.length > 200) return;
-		const volume = (typeof data.volume === 'number' && isFinite(data.volume)) ? Math.max(0, Math.min(1, data.volume)) : 1;
-		const variance = (typeof data.variance === 'number' && isFinite(data.variance)) ? Math.max(0, Math.min(1, data.variance)) : 0;
-		const radius = (typeof data.radius === 'number' && isFinite(data.radius)) ? Math.max(0, Math.min(64, data.radius)) : undefined;
-		const speed = (typeof data.speed === 'number' && isFinite(data.speed)) ? Math.max(0.1, Math.min(4, data.speed)) : undefined;
-		world.broadcastHostState(ctx, username, 'enemySound', {
-			uid: data.uid, path: data.path, volume, variance,
-			loop: data.loop === true, global: data.global === true,
+		if (relayFieldThrottled('_mpLastESndRelay')) return;
+		const can = wireDecodeHot('enemySound', data);
+		if (!can || typeof can.uid !== 'number' || !Number.isInteger(can.uid) || can.uid <= 0) return;
+		if (typeof can.path !== 'string' || !can.path || can.path.length > 200) return;
+		const volume = (typeof can.volume === 'number' && isFinite(can.volume)) ? Math.max(0, Math.min(1, can.volume)) : 1;
+		const variance = (typeof can.variance === 'number' && isFinite(can.variance)) ? Math.max(0, Math.min(1, can.variance)) : 0;
+		const radius = (typeof can.radius === 'number' && isFinite(can.radius)) ? Math.max(0, Math.min(64, can.radius)) : undefined;
+		const speed = (typeof can.speed === 'number' && isFinite(can.speed)) ? Math.max(0.1, Math.min(4, can.speed)) : undefined;
+		relayHotStream(ctx, username, 'enemySound', {
+			uid: can.uid, path: can.path, volume, variance,
+			loop: can.loop === true, global: can.global === true,
 			...(radius !== undefined ? { radius } : {}),
 			...(speed !== undefined ? { speed } : {}),
-		});
+		}, true);
 	});
 
 	// ---- 1.71.9 (issue 7): STOP_SOUNDS relay for looped enemy sounds ----
@@ -1111,9 +2134,10 @@ function handleConnection(socket) {
 	// handle per uid; this tells them to cut it. Host-only like enemySound.
 	socket.on('enemySoundStop', function (data) {
 		if (dropIfNotAuthed('enemySoundStop')) return;
-		if (rateLimited('enemySoundStop', 60)) return;
-		if (!data || typeof data.uid !== 'number' || !Number.isInteger(data.uid) || data.uid <= 0) return;
-		world.broadcastHostState(ctx, username, 'enemySoundStop', { uid: data.uid });
+		if (relayFieldThrottled('_mpLastESndStopRelay')) return;
+		const can = wireDecodeHot('enemySoundStop', data);
+		if (!can || typeof can.uid !== 'number' || !Number.isInteger(can.uid) || can.uid <= 0) return;
+		relayHotStream(ctx, username, 'enemySoundStop', { uid: can.uid }, true);
 	});
 
 	// ---- 1.73.0 (admin UI): item catalog feed + debug-command acks ----
@@ -1475,11 +2499,16 @@ function handleConnection(socket) {
 
 	socket.on('throwBall', function (data) {
 		if (dropIfNotAuthed('throwBall')) return;
-		if (!data) return;
+		// 1.80.x (combat caps): field-cap relay window (throws are event-driven
+		// and far below the cap; this only catches floods).
+		if (relayFieldThrottled('_mpLastThrowRelay')) return;
+		// 1.80.x (combat streams): decode any wire format first, then stamp.
+		const can = wireDecodeHot('throwBall', data);
+		if (!can || typeof can !== 'object') return;
 		// Always stamp the real sender as the combatant — never trust a client-
 		// supplied name, or a ball could be attributed to (and damage) someone else.
-		data.combatant = username;
-		world.broadcastToInstance(ctx, username, 'throwBall', data);
+		can.combatant = username;
+		relayHotStream(ctx, username, 'throwBall', can);
 	});
 
 	// ---- round 11: special-skill effect replay ----
@@ -1942,6 +2971,18 @@ function handleConnection(socket) {
 	// ---- 1.77.x: player-to-player trading (see the module-level trade block) ----
 	// merchant presence: broadcast so every same-instance client draws the trader
 	// icon over that player's mirror and can click/interact to invite.
+	// 1.79.x (bandwidth): the client changed its wire-schema preference (标准/
+	// 调试). Recompute the party-wide effective mode and push it to everyone.
+	socket.on('netSchemaPref', function (data) {
+		if (dropIfNotAuthed('netSchemaPref')) return;
+		if (rateLimited('netSchemaPref', 2)) return;
+		const v = data && data.v;
+		if (v !== 'c' && v !== 'd') return;
+		if (socket._mpSchemaPref === v) return;
+		socket._mpSchemaPref = v;
+		netSchemaRecomputeFor(username);
+	});
+
 	socket.on('tradeMerchant', function (data) {
 		if (dropIfNotAuthed('tradeMerchant')) return;
 		if (rateLimited('tradeMerchant', 5)) return;
@@ -2387,16 +3428,28 @@ function handleConnection(socket) {
 	// visual copy at the true spot. Any client -> same-instance others (like puzzleState).
 	socket.on('playerBall', function (data) {
 		if (dropIfNotAuthed('playerBall')) return;
-		if (rateLimited('playerBall', 90)) return; // balls stream at the block cadence (~30Hz)
-		if (!data || typeof data.map !== 'string' || data.map.length > 96 || !Array.isArray(data.entries)) return;
+		// 1.80.x (combat caps): field-cap relay window (replaces the old 90/s
+		// counter; balls stream at min(cap, hostTickRate)).
+		if (relayFieldThrottled('_mpLastBallRelay')) return;
+		// 1.80.x (combat streams): decode any wire format FIRST (encoded payloads
+		// carry the entries in d/k), then run today's whitelist on the canonical.
+		const can = wireDecodeHot('playerBall', data);
+		if (!can || typeof can.map !== 'string' || can.map.length > 96 || !Array.isArray(can.entries)) return;
 		const num = (v) => (typeof v === 'number' && isFinite(v)) ? Math.round(v) : 0;
 		const out = [];
-		for (const e of data.entries) {
+		for (const e of can.entries) {
 			if (!e || typeof e !== 'object' || typeof e.i !== 'number') continue;
 			if (out.length >= 32) break;
+			// A dead marker rides along as-is; live entries keep the whitelist.
+			// 1.80.x (combat bandwidth): el/chg are OPTIONAL now — the sender's
+			// follow-up entries omit them (first-frame static split) and the
+			// receivers merge their caches, so a missing field must STAY missing
+			// (num() would materialize a wrong el:0).
+			if (e.dead === 1) { out.push({ i: num(e.i), dead: 1 }); continue; }
 			out.push({
 				i: num(e.i),                          // the sender's ball uid
-				el: num(e.el), chg: num(e.chg),                        // sc.ELEMENT (0..4) -> ball tint
+				el: (typeof e.el === 'number' && isFinite(e.el)) ? Math.round(e.el) : undefined,
+				chg: (e.chg === 1 || e.chg === 0) ? e.chg : undefined,
 				// 1.75.x: the matched proxy NAME (skill projectiles keep their real
 				// visuals on receivers instead of the default element ball).
 				pn: (typeof e.pn === 'string' && e.pn.length > 0 && e.pn.length <= 40) ? e.pn : undefined,
@@ -2405,7 +3458,15 @@ function handleConnection(socket) {
 			});
 		}
 		if (!out.length) return;
-		world.broadcastToInstance(ctx, username, 'playerBall', { from: username, map: data.map, entries: out });
+		const canonical = { from: username, map: can.map, entries: out };
+		// Absorb static-bearing entries (legacy-merge source); dead markers prune.
+		const m = ballStaticOf(username);
+		for (const e of out) {
+			if (e.dead === 1) m.delete(e.i);
+			else if (e.el !== undefined || e.chg !== undefined || e.pn !== undefined) m.set(e.i, { el: e.el, chg: e.chg, pn: e.pn });
+		}
+		while (m.size > 256) m.delete(m.keys().next().value);
+		relayHotStream(ctx, username, 'playerBall', canonical);
 	});
 
 	// 1.74.0: a member's charged ball / bomb hit a host-authoritative sliding block.
@@ -2645,8 +3706,16 @@ function handleConnection(socket) {
 	// sender's username is authoritative (stamped server-side, never trusted).
 	socket.on('updatePlayerStats', function (data) {
 		if (dropIfNotAuthed('updatePlayerStats')) return;
+		// 1.79.x: the client now edge-gates + heartbeats this stream, so legit
+		// traffic is <= heal + a few edges per second; a hard per-second ceiling
+		// stops a hostile client from flooding the HUD channel again.
+		if (rateLimited('updatePlayerStats', 30)) return;
+		// 1.79.x: same per-area relay cap as playerState.
+		if (relayThrottled('_mpLastStatsRelay')) return;
+		// 1.79.x: decode 标准/调试 wire formats (legacy passes through).
+		data = wireDecodeHot('updatePlayerStats', data);
 		if (!data) return;
-		world.broadcastToInstance(ctx, username, 'updatePlayerStats', {
+		relayHotStream(ctx, username, 'updatePlayerStats', {
 			player: username, hp: data.hp, maxHp: data.maxHp, sp: data.sp, maxSp: data.maxSp,
 			// Element badge (party-HUD portrait icon + overload fill): element mode 0-4,
 			// element load 0-1 (quantized), overload flag. Validated so malformed packets
@@ -3712,6 +4781,11 @@ function handleConnection(socket) {
 	socket.on('botState', function (data) {
 		if (dropIfNotAuthed('botState')) return;
 		if (rateLimited('botState', 30)) return;
+		// 1.79.x: same per-area relay cap as playerState (the leader's stream is
+		// 15Hz internally; towns cap it to relayMaxTickTown).
+		if (relayThrottled('_mpLastBotRelay')) return;
+		// 1.79.x: decode 标准/调试 wire formats (legacy passes through).
+		data = wireDecodeHot('botState', data);
 		if (!data || !Array.isArray(data.bots)) return;
 		const num = (v) => (typeof v === 'number' && isFinite(v)) ? Math.round(v) : undefined;
 		const bots = [];
@@ -3729,7 +4803,7 @@ function handleConnection(socket) {
 			if (e.x === undefined || e.y === undefined || e.z === undefined) continue;
 			bots.push(e);
 		}
-		world.broadcastToInstance(ctx, username, 'botState', {
+		relayHotStream(ctx, username, 'botState', {
 			map: typeof data.map === 'string' ? data.map.slice(0, 64) : '',
 			bots: bots.slice(0, 8),
 			from: username,

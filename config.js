@@ -56,6 +56,18 @@
 //                       = players NEVER collide (walk-through everywhere, not just
 //                       towns/cutscenes). true = normal player-vs-player collision.
 //                       Sent to clients as `playerCollision` in the handshakeResponse.
+//   relayMaxTickField / relayMaxTickTown
+//                       MAX RELAY rates (Hz, [1,60]) the server enforces on the
+//                       three hot streams (playerState / updatePlayerStats /
+//                       botState), by the sender's area type (field = paths and
+//                       dungeons, town = shared towns). Defaults 30 / 10. Sent to
+//                       clients in the handshakeResponse + the /version HTTP
+//                       probe so the connect screen can show them; clients align
+//                       their own send floors to the caps (no wasted upstream).
+//   healHz              self-heal heartbeat frequency for the three hot streams
+//                       (Hz, float, [0.5,60]; default 1). Effective rate = min(
+//                       healHz, current area cap). Also surfaced in the
+//                       handshakeResponse and /version probe.
 //   softDeathReviveHpNormal / softDeathReviveHpBoss
 //                       HP fraction restored on a soft-death revive. Normal field /
 //                       non-boss combat revives use the former (default 0.5 = 50%);
@@ -137,6 +149,32 @@ const DEFAULTS = {
 	// account cannot trade for this many hours (item state was rewound, so
 	// trading would duplicate goods). 0 disables the lockout entirely.
 	tradeLockHours: 48,
+	// 1.79.x (bandwidth): server-side MAX RELAY rates (Hz) for the three hot
+	// streams (playerState / updatePlayerStats / botState). Field covers
+	// paths/dungeons; town covers the shared town instances (crowded spaces,
+	// usually run lower). Hard caps: relays above the cap are dropped, and the
+	// clients align their own send floors to them via the handshake. [1, 60].
+	relayMaxTickField: 30,
+	relayMaxTickTown: 10,
+	// 1.79.x (bandwidth): self-heal heartbeat frequency (Hz; FLOAT allowed —
+	// 0.5 = one heal packet every 2s, 2 = two per second). The three hot
+	// streams send one unconditional full packet at this rate so a lost packet
+	// self-heals. The EFFECTIVE rate never exceeds the current area's relay
+	// cap (min(healHz, cap)). Lower bound 0.5 keeps the botState stall
+	// detector (2.5x the heartbeat interval) from misfiring.
+	healHz: 1,
+	// 1.80.x (capacity): MAX CONCURRENT PLAYERS. The handshake rejects any new
+	// login once this many players are online (the rejected client gets a
+	// "server full" message instead of a session). [1, 255].
+	maxPlayers: 20,
+	// 1.80.x (idle kick): auto-disconnect after this many MINUTES without
+	// keyboard/mouse input, per area type (field = paths/dungeons, town = shared
+	// towns; town default is far more lenient because idling in town is normal).
+	// Game events (being hit, dying, reviving, cutscenes) NEVER reset the timer
+	// — only real input does. 0 disables that area's auto-disconnect.
+	// [0, 43200] (0 = off, 43200 = 30 days).
+	afkFieldMinutes: 120,
+	afkTownMinutes: 720,
 	// 1.78.x (progress wall): map IDs players may NOT enter (mod-undeveloped
 	// areas). A client attempting to enter one keeps its current map — the
 	// teleport is cancelled BEFORE any load, so the blocked map's story never
@@ -149,7 +187,7 @@ const DEFAULTS = {
 // Round 17: mod version. The server rejects any client whose mod version differs
 // (handshake gate in protocol.js). Bump this TOGETHER with the client mod version
 // (client src/multiplayer.ts MP_VERSION + package.json "version") on every release.
-const MOD_VERSION = '0.2.5';
+const MOD_VERSION = '0.2.6';
 
 function loadConfig() {
 	const cfg = Object.assign({}, DEFAULTS);
@@ -215,6 +253,30 @@ function loadConfig() {
 		{
 			const h = Number(cfg.tradeLockHours);
 			cfg.tradeLockHours = (isFinite(h) && h >= 0 && h <= 8760) ? h : DEFAULTS.tradeLockHours;
+		}
+		// 1.79.x (bandwidth): relay caps [1, 60] Hz; heal heartbeat [0.5, 60] Hz
+		// (lower bound 0.5 so the client's botState stall detection stays valid).
+		{
+			const hz = (key, def) => {
+				const v = Number(cfg[key]);
+				return (isFinite(v) && v >= 1 && v <= 60) ? v : def;
+			};
+			cfg.relayMaxTickField = hz('relayMaxTickField', DEFAULTS.relayMaxTickField);
+			cfg.relayMaxTickTown = hz('relayMaxTickTown', DEFAULTS.relayMaxTickTown);
+			const heal = Number(cfg.healHz);
+			cfg.healHz = (isFinite(heal) && heal >= 0.5 && heal <= 60) ? heal : DEFAULTS.healHz;
+		}
+		// 1.80.x (capacity/idle): player cap [1, 255]; AFK kick minutes
+		// [0, 43200] (0 = disabled for that area).
+		{
+			const mp = Number(cfg.maxPlayers);
+			cfg.maxPlayers = (isFinite(mp) && mp >= 1 && mp <= 255) ? Math.floor(mp) : DEFAULTS.maxPlayers;
+			const mins = (key, def) => {
+				const v = Number(cfg[key]);
+				return (isFinite(v) && v >= 0 && v <= 43200) ? v : def;
+			};
+			cfg.afkFieldMinutes = mins('afkFieldMinutes', DEFAULTS.afkFieldMinutes);
+			cfg.afkTownMinutes = mins('afkTownMinutes', DEFAULTS.afkTownMinutes);
 		}
 		// 1.78.x (progress wall): sanitize to a deduped lowercase DOTTED-id list
 		// so the changeMap gate here and the client's teleport gate compare one
@@ -303,6 +365,11 @@ console.log('[config] multiplayer mod v' + config.version +
 	' | saveUploadKbS = ' + config.saveUploadKbS +
 	' | saveDownloadKbS = ' + config.saveDownloadKbS +
 	' | playerCollision = ' + config.playerCollision +
+	' | relay = field ' + config.relayMaxTickField + 'Hz / town ' + config.relayMaxTickTown + 'Hz' +
+	' | heal = ' + config.healHz + 'Hz' +
+	' | maxPlayers = ' + config.maxPlayers +
+	' | afk = field ' + (config.afkFieldMinutes ? config.afkFieldMinutes + 'min' : 'off') +
+	' / town ' + (config.afkTownMinutes ? config.afkTownMinutes + 'min' : 'off') +
 	' | port = ' + config.port);
 
 module.exports = config;

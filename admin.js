@@ -22,6 +22,7 @@ const config = require('./config');
 const persistence = require('./persistence');
 const savecodec = require('./savecodec');
 const itemdb = require('./itemdb');
+const traffic = require('./traffic');
 const { isValidName } = require('./validate');
 
 const ADMIN_HTML = path.join(__dirname, 'admin.html');
@@ -239,7 +240,23 @@ function createRouter(config) {
 			out.push({ name, online: accounts.isOnline(name), lastSeen: a.lastSeen || null, createdAt: a.createdAt || null, updatedAt, tradeLockUntil, hasPassword: pw.hasPassword, reset: pw.reset, resetLockedUntil: pw.resetLockedUntil, loginLockedUntil: pw.loginLockedUntil });
 		}
 		out.sort((x, y) => (y.online - x.online) || String(x.name).localeCompare(String(y.name)));
-		res.json({ ok: true, players: out, tradeLockHours: config.tradeLockHours });
+		// 1.80.x (admin sidebar stats): player counts match the LISTED accounts
+		// (bots excluded), and the traffic sample comes from traffic.js's
+		// engine.io-level byte meter (per-second rate + 1-minute average).
+		let onlineCount = 0;
+		for (const p of out) if (p.online) onlineCount++;
+		const tf = traffic.sample();
+		res.json({
+			ok: true, players: out, tradeLockHours: config.tradeLockHours,
+			stats: {
+				online: onlineCount,
+				total: out.length,
+				upBps: tf.upBps,
+				downBps: tf.downBps,
+				upAvgBps: tf.upAvgBps,
+				downAvgBps: tf.downAvgBps,
+			},
+		});
 	});
 
 	// one player's save detail

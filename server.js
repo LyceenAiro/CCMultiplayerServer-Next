@@ -4,6 +4,8 @@ var io = require('socket.io')(http);
 require('./cmd.js');
 var protocol = require('./protocol.js');
 var config = require('./config');
+var accounts = require('./accounts.js');
+var traffic = require('./traffic.js');
 
 var fs = require('fs');
 var path = require('path');
@@ -63,9 +65,21 @@ app.get(['^/data/*', '^/media/*'], function(req, res){
 // ROUND 79 (server-list version): the client's server browser probes this endpoint
 // to show each server card's mod version (the SAME config.version the login
 // handshake reports). CORS-open, tiny, no auth - the version is public information.
+// 1.79.x (bandwidth): also surfaces the relay caps + heal rate so the CONNECT
+// SCREEN can show them before joining (older servers omit the fields; the
+// client then simply renders nothing extra).
 app.get('/version', function(req, res){
 	res.set({'Access-Control-Allow-Origin': '*'});
-	res.json({ version: config.version });
+	res.json({
+		version: config.version,
+		relayMaxTickField: config.relayMaxTickField,
+		relayMaxTickTown: config.relayMaxTickTown,
+		healHz: config.healHz,
+		// 1.80.x (capacity): live occupancy for the connect screen's
+		// "online/max" line.
+		maxPlayers: config.maxPlayers,
+		online: accounts.onlineNames().length,
+	});
 });
 
 // 1.73.0: admin web UI + REST API at /admin (requires config.json "adminToken";
@@ -87,6 +101,11 @@ app.use('/auth', auth.createRouter({ accounts: require('./accounts.js'), persist
 app.get(/^(?!(\/media\/|\/data\/))/g, function(req, res){
 	res.status(404).end();
 });
+
+// 1.80.x (admin stats): byte meter for the admin sidebar's live traffic row.
+// Attaches to io.engine's per-connection packet events, so it must be installed
+// BEFORE clients connect (right here, at boot).
+traffic.attach(io);
 
 io.on('connection', function(socket){ protocol.handleConnection(socket) });
 
