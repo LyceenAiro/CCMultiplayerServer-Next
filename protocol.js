@@ -1975,6 +1975,20 @@ function handleConnection(socket) {
 			: 0;
 		world.broadcastHostState(ctx, username, 'bossPhase', { map: data.map, uid });
 	});
+	// 0.2.6: HOST's scripted boss-defeat cutscene just STARTED (engine wrote the
+	// enemy's manualKill var, e.g. map.bossKill on heat-dng.f4.boss). Relay that
+	// INSTANT to the instance so members stage the same BossDies cinematic at the
+	// same moment — waiting for the entityState h<=0 block (or for the host
+	// cinematic to finish and drop the corpse) is exactly the "death anim waits
+	// for the host" bug. Host-only like bossPhase. mk = manualKill var name.
+	socket.on('bossDefeat', function (data) {
+		if (dropIfNotAuthed('bossDefeat')) return;
+		if (rateLimited('bossDefeat', 2)) return;
+		if (!data || typeof data.map !== 'string' || !data.map || data.map.length > 128) return;
+		if (typeof data.mk !== 'string' || !data.mk || data.mk.length > 96) return;
+		if (!/^[A-Za-z0-9_.\-]+$/.test(data.mk)) return;
+		world.broadcastHostState(ctx, username, 'bossDefeat', { map: data.map, mk: data.mk });
+	});
 	// ---- round 82: door-open visual sync ----
 	// When a player walks into a mapped door their client broadcasts the door so the
 	// other members on the same map can open their local copy and watch the remote
