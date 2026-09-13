@@ -14,7 +14,7 @@ updates are sent here and forwarded to the other players on the same map
 instance. The server also elects the **host**, migrates it when the host leaves,
 and owns accounts, cloud saves, parties, friends, trading and admin tools.
 
-> **Current release: 3.0.0.** Must match the client handshake version.
+> **Current release: 3.0.3.** Must match the client handshake version.
 > The server is game-version agnostic (CrossCode 1.1.0 and 1.4.2 share the same
 > wire style), but the Next fork is a large extension of the original relay —
 > see the feature notes below.

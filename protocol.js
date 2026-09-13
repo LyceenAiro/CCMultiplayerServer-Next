@@ -196,6 +196,10 @@ WIRE_STR_DICT.forEach(function (s, i) { WIRE_STR_INDEX[s] = i + 1; });
 function WireWriter() { this.bytes = []; }
 WireWriter.prototype.u8 = function (v) { this.bytes.push(v & 0xff); };
 WireWriter.prototype.i8 = function (v) { v = (v < -128 ? -128 : v > 127 ? 127 : v); this.bytes.push(v & 0xff); };
+WireWriter.prototype.i16 = function (v) {
+	v = (v < -32768 ? -32768 : v > 32767 ? 32767 : Math.round(v));
+	this.bytes.push(v & 0xff, (v >> 8) & 0xff);
+};
 WireWriter.prototype.u8c = function (v, lo, hi) { v = Math.round(v); this.bytes.push((v < lo ? lo : v > hi ? hi : v) & 0xff); };
 WireWriter.prototype.var = function (n) {
 	let v = Math.max(0, Math.round(n));
@@ -225,6 +229,12 @@ function WireReader(buf) { this.b = buf; this.p = 0; }
 WireReader.prototype.left = function () { return this.b.length - this.p; };
 WireReader.prototype.u8 = function () { return this.p < this.b.length ? this.b[this.p++] & 0xff : 0; };
 WireReader.prototype.i8 = function () { const v = this.u8(); return v >= 128 ? v - 256 : v; };
+WireReader.prototype.i16 = function () {
+	const lo = this.u8();
+	const hi = this.u8();
+	const v = lo | (hi << 8);
+	return v >= 32768 ? v - 65536 : v;
+};
 WireReader.prototype.var = function () {
 	let shift = 0, out = 0;
 	while (this.left() > 0) {
@@ -608,13 +618,20 @@ function wireEncCThrowBall(o) {
 	const dir = o.dir || {};
 	const pos = o.pos;
 	const combatantStr = typeof o.combatant === 'string';
+	// 0.2.6: normalize first (see wireSchema.ts). i8×100 clamped |dir|>1.27 and
+	// collapsed free-aim ball angles to the four diagonals on receivers.
+	const dx = Number(dir.x) || 0;
+	const dy = Number(dir.y) || 0;
+	const len = Math.hypot(dx, dy);
+	const nx = len > 1e-6 ? dx / len : 0;
+	const ny = len > 1e-6 ? dy / len : 0;
 	w.str(o.ballInfo || '');
 	w.u8((pos ? 1 : 0) | (o.bn ? 2 : 0) | (combatantStr ? 4 : 0));
 	if (combatantStr) w.str(o.combatant || '');
 	else w.var(typeof o.combatant === 'number' ? Math.max(0, Math.round(o.combatant)) : 0);
 	w.u8c(o.party || 0, 0, 255);
-	w.i8(Math.round((dir.x || 0) * 100));
-	w.i8(Math.round((dir.y || 0) * 100));
+	w.i16(Math.round(nx * 10000));
+	w.i16(Math.round(ny * 10000));
 	if (pos) { w.zig(pos.x || 0); w.zig(pos.y || 0); w.zig(pos.z || 0); }
 	if (o.bn) w.str(o.bn || '');
 	return w.out();
@@ -625,7 +642,7 @@ function wireDecCThrowBall(r) {
 	if (fl & 4) out.combatant = r.str();
 	else out.combatant = r.var();
 	out.party = r.u8();
-	out.dir = { x: r.i8() / 100, y: r.i8() / 100 };
+	out.dir = { x: r.i16() / 10000, y: r.i16() / 10000 };
 	if (fl & 1) out.pos = { x: r.zig(), y: r.zig(), z: r.zig() };
 	if (fl & 2) out.bn = r.str();
 	return out;
@@ -2095,6 +2112,26 @@ function handleConnection(socket) {
 			if (e && typeof e === 'object' && e.uid !== undefined) list.push(e);
 		}
 		world.broadcastToInstance(ctx, username, 'cutsceneEntity', { from: username, map: data.map, list });
+	});
+
+	// ---- 0.2.6: cutscene NPC visibility/position (story actors) ----
+	// SHOW_ENTITY / force-show of mid-scene NPCs is purely local. Without this
+	// stream a peer that is not replaying the same event never sees those
+	// actors (they stay spawnCondition-hidden). Same shape as cutsceneEntity:
+	// NOT host-gated — the client running the cutscene streams its visible
+	// named NPCs; receivers force-show / materialize the matching names.
+	socket.on('cutsceneNpc', function (data) {
+		if (dropIfNotAuthed('cutsceneNpc')) return;
+		if (rateLimited('cutsceneNpc', 30)) return;
+		if (!data || typeof data.map !== 'string' || !Array.isArray(data.list) || data.list.length > 48) return;
+		const list = [];
+		for (const e of data.list) {
+			if (e && typeof e === 'object' && typeof e.n === 'string' && e.n.length > 0 && e.n.length <= 48) {
+				list.push(e);
+			}
+		}
+		if (!list.length) return;
+		world.broadcastToInstance(ctx, username, 'cutsceneNpc', { from: username, map: data.map, list });
 	});
 
 	// ---- round 17: host forwards an enemy ATTACK (uid + attack anim) to members ----
