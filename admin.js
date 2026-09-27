@@ -12,6 +12,8 @@
 //   - export / import the MAIN save only (mirrors are never touched either way)
 //   - rename a player (account + friend lists + save file; online player is
 //     disconnected so they re-login under the new name)
+//   - delete a player permanently (account + friend lists + save file; online
+//     player is kicked and must re-register from scratch)
 //   - debug commands to ONLINE players over the game socket (adminCommand /
 //     adminAck): giveExp / giveCredits / giveItem / teleport
 const fs = require('fs');
@@ -153,6 +155,52 @@ function renamePlayer(oldName, newName) {
 	return { ok: true, msg: '已改名' };
 }
 
+/** 0.2.6: permanently delete an account. Removes the db record, every
+ * friend/incoming/outgoing reference, and the per-user save file (mirrors
+ * live inside that file). An online player is disconnected first; they must
+ * re-register under the same name to play again. */
+function deletePlayer(name) {
+	if (!name || typeof name !== 'string') return { ok: false, msg: '名字不合法' };
+	const db = persistence.db;
+	if (!db.accounts[name]) return { ok: false, msg: '玩家不存在' };
+	// 1) kick an online session BEFORE wiping the account so their socket cannot
+	//    keep uploading a save that re-creates the file. No adminRenamed ping —
+	//    that path makes the client re-login under a (now deleted) name.
+	if (accounts.isOnline(name)) {
+		const sock = accounts.getSocket(name);
+		try { accounts.logout(name); } catch (e) { /* ignore */ }
+		setTimeout(() => {
+			try { if (sock) sock.disconnect(true); } catch (e) { /* ignore */ }
+		}, 200);
+	}
+	// 2) strip every friend/incoming/outgoing reference.
+	for (const k in db.accounts) {
+		if (k === name) continue;
+		const a = db.accounts[k];
+		for (const arr of ['friends', 'incoming', 'outgoing']) {
+			if (!Array.isArray(a[arr])) continue;
+			for (let i = a[arr].length - 1; i >= 0; i--) {
+				if (a[arr][i] === name) a[arr].splice(i, 1);
+			}
+		}
+	}
+	// 3) drop the account record and persist.
+	delete db.accounts[name];
+	persistence.save();
+	// 4) delete the save file (best-effort — a missing file is already gone).
+	const file = saveFileForPublic(name);
+	let fileDeleted = false;
+	try {
+		if (fs.existsSync(file)) { fs.unlinkSync(file); fileDeleted = true; }
+		const tmp = file + '.tmp';
+		if (fs.existsSync(tmp)) { try { fs.unlinkSync(tmp); } catch (e) { /* ignore */ } }
+	} catch (e) {
+		return { ok: true, msg: '账户记录已删除，但存档文件删除失败: ' + e.message + '；该玩家下次登录将按新账号处理（若文件仍在可能恢复进度）' };
+	}
+	console.log('[admin] permanently deleted account ' + name + (fileDeleted ? ' (+ save file)' : ' (no save file)'));
+	return { ok: true, msg: '账户「' + name + '」已彻底删除' + (fileDeleted ? '（含存档）' : '（无存档文件）') + '；该玩家需重新注册' };
+}
+
 // saveFileFor is module-private in persistence.js — replicate exactly.
 function saveFileForPublic(username) {
 	let h = 0;
@@ -243,6 +291,9 @@ function createRouter(config) {
 		// 1.80.x (admin sidebar stats): player counts match the LISTED accounts
 		// (bots excluded), and the traffic sample comes from traffic.js's
 		// engine.io-level byte meter (per-second rate + 1-minute average).
+		// 0.2.6: also ship maxPlayers + the REAL occupancy (accounts.onlineNames,
+		// same number the login gate uses) so the sidebar can show 在线/上限
+		// instead of 在线/注册账号总数 (which looked like a wrong capacity).
 		let onlineCount = 0;
 		for (const p of out) if (p.online) onlineCount++;
 		const tf = traffic.sample();
@@ -251,6 +302,8 @@ function createRouter(config) {
 			stats: {
 				online: onlineCount,
 				total: out.length,
+				maxPlayers: config.maxPlayers,
+				occupancy: accounts.onlineNames().length,
 				upBps: tf.upBps,
 				downBps: tf.downBps,
 				upAvgBps: tf.upAvgBps,
@@ -334,6 +387,15 @@ function createRouter(config) {
 		const newName = req.body && typeof req.body.newName === 'string' ? req.body.newName.trim() : '';
 		if (!accounts.exists(name)) return res.status(404).json({ ok: false, msg: '玩家不存在' });
 		res.json(renamePlayer(name, newName));
+	});
+
+	// 0.2.6: permanently delete the account (account + friends + save file).
+	// Bot companion accounts are never deletable through this route.
+	router.post('/api/player/:name/delete', (req, res) => {
+		const name = req.params.name;
+		if (bots.isBotName(name)) return res.status(400).json({ ok: false, msg: '机器人账户不可删除' });
+		if (!accounts.exists(name)) return res.status(404).json({ ok: false, msg: '玩家不存在' });
+		res.json(deletePlayer(name));
 	});
 
 	// clear the anti-dupe trade lockout (admin override). Clears the save-file

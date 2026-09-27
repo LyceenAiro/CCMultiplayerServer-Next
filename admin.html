@@ -124,9 +124,9 @@ main { position:relative; z-index:1; display:flex; height:calc(100vh - 52px); }
 
 /* ===== 右侧详情区 ===== */
 #detail { flex:1; overflow-y:auto; padding:22px 28px 40px; }
-#detail > * { max-width:960px; }
+#detail > * { max-width:1040px; }
 #detail > .dim:only-child { margin-top:60px; text-align:center; letter-spacing:.12em; }
-#detail > .panel, #detail > h2, #detail > #msg { animation:panelIn .18s ease-out; }
+#detail > .panel, #detail > .grid2, #detail > h2, #detail > #msg { animation:panelIn .18s ease-out; }
 @keyframes panelIn { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:none; } }
 
 h2 { margin:0 0 14px; font-size:19px; letter-spacing:.06em; display:flex; align-items:center; gap:12px; }
@@ -157,11 +157,12 @@ h2 { margin:0 0 14px; font-size:19px; letter-spacing:.06em; display:flex; align-
   box-shadow:0 0 7px rgba(255,165,46,.65);
 }
 
-table.kv { border-collapse:collapse; margin-top:2px; }
-table.kv td { padding:5px 30px 5px 0; vertical-align:top; }
-table.kv td.k { color:var(--dim); font-size:12px; letter-spacing:.08em; white-space:nowrap; padding-top:7px; }
+table.kv { border-collapse:collapse; width:100%; margin-top:2px; }
+table.kv td { padding:6px 18px 6px 0; vertical-align:top; }
+table.kv tr + tr td { border-top:1px solid rgba(39,64,95,.35); }
+table.kv td.k { width:72px; color:var(--dim); font-size:12px; letter-spacing:.08em; white-space:nowrap; padding-top:8px; }
 
-.row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:10px 0; }
+.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0; }
 
 /* ===== 按钮：切角 + 能量渐变 ===== */
 button {
@@ -254,6 +255,64 @@ select option { background:#0b1426; }
 ::-webkit-scrollbar-thumb { background:#22395c; border-radius:5px; border:2px solid #070b16; }
 ::-webkit-scrollbar-thumb:hover { background:#31527f; }
 
+/* ===== 3.0.3 布局整理：区块头 / 状态行 / 标签 / 双栏网格 ===== */
+.grid2 { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:14px; margin-bottom:16px; }
+.grid2 > .panel { margin-bottom:0; height:100%; }
+
+/* 区块标题：斜块 + 标题 + 右侧提示 + 渐隐分隔线（替代裸 <b> 标题） */
+.phead { display:flex; align-items:center; gap:10px; margin:0 0 10px; }
+.phead::after { content:""; flex:1; height:1px;
+  background:linear-gradient(90deg, rgba(79,200,255,.28), rgba(79,200,255,.02)); }
+.ptitle { display:inline-flex; align-items:center; gap:9px; white-space:nowrap;
+  font-size:12px; font-weight:700; letter-spacing:.20em; color:var(--cyan); }
+.ptitle::before { content:""; width:8px; height:8px; transform:skewX(-18deg);
+  background:linear-gradient(135deg, var(--orange-hi), var(--orange));
+  box-shadow:0 0 7px rgba(255,165,46,.65); }
+.phint { color:var(--dim); font-size:11px; letter-spacing:.04em; white-space:nowrap; }
+.panel.danger { border-color:rgba(255,95,110,.42); }
+.panel.danger .ptitle { color:var(--bad); }
+.panel.danger .ptitle::before { background:linear-gradient(135deg,#ff8e9f,#ff5f6e); box-shadow:0 0 7px rgba(255,95,110,.6); }
+.panel.danger .phead::after { background:linear-gradient(90deg, rgba(255,95,110,.28), rgba(255,95,110,.02)); }
+
+/* 状态行：标签 / 取值 / 右对齐操作按钮 */
+.srow { display:flex; align-items:center; gap:12px; padding:8px 0; }
+.srow + .srow { border-top:1px solid rgba(39,64,95,.35); }
+.srow .sk { flex:none; width:72px; color:var(--dim); font-size:12px; letter-spacing:.10em; }
+.srow .sv { flex:1; min-width:0; display:flex; flex-wrap:wrap; align-items:center; gap:6px 10px; }
+.srow .sact { flex:none; margin-left:auto; display:flex; gap:8px; }
+
+/* 状态标签（替代行内 style 的红/绿文字） */
+.tag { display:inline-flex; align-items:center; gap:5px; padding:2px 9px; white-space:nowrap;
+  font-size:11px; letter-spacing:.06em; border:1px solid; border-radius:2px; }
+.tag.ok { color:var(--ok); border-color:rgba(79,224,138,.45); background:rgba(79,224,138,.08); }
+.tag.bad { color:var(--bad); border-color:rgba(255,95,110,.45); background:rgba(255,95,110,.08); }
+.tag.warn { color:var(--orange-hi); border-color:rgba(255,165,46,.5); background:rgba(255,165,46,.08); }
+.tag.dim { color:var(--dim); border-color:rgba(127,149,184,.30); background:rgba(127,149,184,.06); }
+
+/* 验证码等短代码：等宽 + 可整体选中 */
+b.code { padding:2px 8px; border:1px solid var(--line-hi); border-radius:3px; user-select:all;
+  font:13px/1.3 Consolas,monospace; letter-spacing:.22em; color:var(--orange-hi); background:rgba(8,14,28,.85); }
+
+/* 按钮补充：小号 / 危险 */
+button.sm { height:26px; padding:0 11px; font-size:11px; letter-spacing:.08em; }
+button.danger { color:#ffe3e7; background:linear-gradient(180deg, #7c2a36, #5c1f28);
+  box-shadow:inset 0 0 0 1px rgba(255,95,110,.55); }
+button.danger:hover { filter:brightness(1.18) drop-shadow(0 0 8px rgba(255,95,110,.35)); }
+
+.empty { padding:12px 4px; color:var(--dim); font-size:12px; letter-spacing:.06em; }
+.mirrorList { display:flex; flex-direction:column; gap:8px; }
+.mirrorList .mirror { margin-bottom:0; }
+
+/* 左栏分组标题 */
+.sideHead { display:flex; align-items:center; gap:8px; padding:12px 12px 4px; }
+.sideHead .t { color:var(--cyan); font-size:11px; font-weight:700; letter-spacing:.20em; white-space:nowrap; }
+.sideHead .t::before { content:""; display:inline-block; width:7px; height:7px; margin-right:8px;
+  transform:skewX(-18deg); background:linear-gradient(135deg, var(--orange-hi), var(--orange)); }
+.sideHead .c { margin-left:auto; color:var(--dim); font:11px/1 Consolas,monospace; letter-spacing:.06em; }
+
+.player .sub { display:flex; flex-wrap:wrap; align-items:center; gap:3px 8px; }
+
+@media (max-width: 1180px) { .grid2 { grid-template-columns:1fr; } }
 @media (max-width: 920px) { #listPanel { width:240px; } #detail { padding:16px 18px 32px; } }
 </style>
 </head>
@@ -266,12 +325,14 @@ select option { background:#0b1426; }
 </header>
 <main>
   <div id="listPanel">
-    <div class="searchWrap"><input id="playerSearch" placeholder="搜索玩家（模糊）…" oninput="renderList()"></div>
+    <div class="sideHead"><span class="t">服务器状态</span></div>
     <div id="statsBox">
-      <div class="stRow"><span class="stK">玩家 在线/总数</span><span class="stV" id="stOnline">—</span></div>
+      <div class="stRow"><span class="stK">玩家 在线/上限</span><span class="stV tip" id="stOnline">—</span></div>
       <div class="stRow"><span class="stK">流量 <span class="up">↑</span>/<span class="down">↓</span></span><span class="stV tip" id="stTraffic">—</span></div>
     </div>
     <div id="resetPanel"></div>
+    <div class="sideHead"><span class="t">玩家列表</span><span class="c" id="listCount">—</span></div>
+    <div class="searchWrap"><input id="playerSearch" placeholder="搜索玩家（模糊）…（回车打开第一个）" oninput="renderList()"></div>
     <div id="list"><div class="dim">加载中…</div></div>
   </div>
   <div id="detail"><div class="dim">← 选择左侧玩家查看详情</div></div>
@@ -328,6 +389,27 @@ function lockRemainMs(p) {
 }
 function esc(s) { return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 
+// 3.0.3: 一键复制（重置验证码复制后口头/私聊核对更方便），按钮短暂显示"已复制"
+function copyText(text, btn) {
+  var t = String(text);
+  var flash = function () {
+    if (!btn) return;
+    var old = btn.textContent;
+    btn.textContent = '已复制';
+    setTimeout(function () { btn.textContent = old; }, 1200);
+  };
+  var fallback = function () {
+    var ta = document.createElement('textarea');
+    ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); flash(); } catch (e) { /* ignore */ }
+    document.body.removeChild(ta);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t).then(flash, fallback);
+  } else fallback();
+}
+
 // 1.80.x: 边栏服务器状态 —— 在线人数与服务器实时流量（随 /players 轮询每 3s 刷新；
 // 流量值为服务器端最近 1 秒窗口的字节速率）。流量的 1 分钟平均值写进 data-tip，
 // 由下方通用悬浮窗（#tooltip）在鼠标悬停时显示。
@@ -341,8 +423,20 @@ function renderStats(st) {
   if (!st) return;
   var onEl = document.getElementById('stOnline');
   if (onEl) {
-    var onHtml = '<b>' + (Number(st.online) || 0) + '</b> / ' + (Number(st.total) || 0);
+    // 0.2.6: 在线/上限（config.maxPlayers）——旧版显示的是 注册账号总数，
+    // 管理员会误以为容量被改成了 51。占用数与登录门同一来源（含 bot）。
+    var occ = Number(st.occupancy);
+    if (!isFinite(occ)) occ = Number(st.online) || 0;
+    var cap = Number(st.maxPlayers);
+    if (!isFinite(cap) || cap <= 0) cap = Number(st.total) || 0;
+    var onHtml = '<b>' + occ + '</b> / ' + cap;
     if (onEl.innerHTML !== onHtml) onEl.innerHTML = onHtml;
+    var tip = '<div class="tname">玩家占用</div>' +
+      '<div class="stat"><span>当前在线（含 bot，登录门同口径）</span><span class="v">' + occ + '</span></div>' +
+      '<div class="stat"><span>maxPlayers 上限</span><span class="v">' + cap + '</span></div>' +
+      '<div class="stat"><span>注册账号总数（不含 bot）</span><span class="v">' + (Number(st.total) || 0) + '</span></div>' +
+      '<div class="stat"><span>列表内在线账号</span><span class="v">' + (Number(st.online) || 0) + '</span></div>';
+    if (onEl.getAttribute('data-tip') !== tip) onEl.setAttribute('data-tip', tip);
   }
   var tfEl = document.getElementById('stTraffic');
   if (tfEl) {
@@ -399,6 +493,7 @@ function renderResetPanel() {
     var mins = Math.max(1, Math.ceil((Number(p.reset.expiresAt) - now) / 60000));
     return '<div class="rcRow"><span class="rcName" onclick="loadDetail(\'' + encodeURIComponent(p.name) + '\')">' + esc(p.name) + '</span>' +
       '<span class="rcCode">' + esc(p.reset.code) + '</span>' +
+      '<button class="ghost sm" onclick="copyText(\'' + esc(p.reset.code) + '\', this)">复制</button>' +
       '<span class="rcExp">剩约 ' + mins + ' 分钟</span></div>';
   }).join('');
   el.innerHTML = html;
@@ -417,14 +512,14 @@ function renderListInner() {
     scored.sort(function(a, b){ return b.score - a.score; });
     shown = scored.map(function(x){ return x.p; });
   }
+  var cnt = document.getElementById('listCount');
+  if (cnt) cnt.textContent = q ? (shown.length + ' / ' + players.length) : String(players.length);
   if (!shown.length) { el.innerHTML = '<div class="dim">' + (q ? '无匹配玩家' : '暂无玩家') + '</div>'; return; }
   el.innerHTML = shown.map(function(p){
     var lm = lockRemainMs(p);
-    var lockHtml = lm > 0
-      ? ' <span style="color:var(--bad)">🔒 交易锁定 剩 ' + fmtLockRemain(lm) + '</span>'
-      : '';
+    var lockHtml = lm > 0 ? ' <span class="tag bad">🔒 交易锁定 ' + fmtLockRemain(lm) + '</span>' : '';
     // 1.78.x: login brute-force lockout badge (wrong-password lock)
-    if (Number(p.loginLockedUntil) > Date.now()) lockHtml += ' <span style="color:var(--bad)">🔒 登录锁定</span>';
+    if (Number(p.loginLockedUntil) > Date.now()) lockHtml += ' <span class="tag bad">🔒 登录锁定</span>';
     return '<div class="player' + (p.name === current ? ' sel' : '') + '" onclick="loadDetail(\'' + encodeURIComponent(p.name) + '\')">' +
       '<div class="nm">' + esc(p.name) + ' <span class="badge ' + (p.online ? 'on' : 'off') + '">' + (p.online ? '在线' : '离线') + '</span></div>' +
       '<div class="sub">存档更新：' + fmtTime(p.updatedAt) + lockHtml + '</div></div>';
@@ -493,80 +588,100 @@ async function loadDetail(encName) {
   renderDetail();
 }
 
+// 3.0.3: 只返回"标签 + 取值"两个单元格（不再自带 <tr>），每行可排两组装备槽位
 function eqRow(eq, label, slot) {
   var cell = '—';
   if (eq[slot]) {
     cell = '<span class="tip" data-item="' + eq[slot].id + '">' + esc(eq[slot].name || ('未知 #' + eq[slot].id)) + '</span> <span class="dim">#' + eq[slot].id + '</span>';
   }
-  return '<tr><td class="k">' + label + '</td><td>' + cell + '</td></tr>';
+  return '<td class="k">' + label + '</td><td>' + cell + '</td>';
 }
 
+// 3.0.3: 详情区重排 —— 统一"区块标题 + 状态行 + 状态标签"结构：
+// 账户状态 / 角色属性+装备（双栏）/ 镜像+存档操作（双栏）/ 危险操作 / 调试工具。
+// 所有元素 id 与 onclick 处理函数保持不变。
 function renderDetail() {
   var d = detail, s = d.save, p = (s && s.player) || {};
   var html = '<div id="msg"></div>';
   html += '<h2>' + esc(d.name) + ' <span class="badge ' + (d.online ? 'on' : 'off') + '">' + (d.online ? '在线' : '离线') + '</span></h2>';
+  // ---- 账户状态：交易锁定 + 登录密码（原先行内样式混排，统一为状态行）----
+  html += '<div class="panel"><div class="phead"><span class="ptitle">账户状态</span></div>';
   // 交易锁定状态（防刷物品限制）：锁定中显示剩余时间与到期时刻，并附服务器配置时长
   var lu = Number(d.tradeLockUntil) || 0;
   var cfgH = (typeof d.tradeLockHours === 'number' && isFinite(d.tradeLockHours) && d.tradeLockHours >= 0) ? d.tradeLockHours : tradeLockHours;
-  var lockTxt;
-  if (lu > Date.now()) {
-    lockTxt = '<span style="color:var(--bad)">🔒 锁定中 — 剩余约 ' + fmtLockRemain(lu - Date.now()) + '（至 ' + fmtTime(new Date(lu)) + '）</span>';
-  } else {
-    lockTxt = '<span style="color:var(--ok)">未锁定</span>';
-  }
-  lockTxt += ' <span class="dim">（配置时长：' + (cfgH > 0 ? (cfgH + ' 小时，0 = 关闭') : '已关闭') + '）</span>';
-  if (lu > Date.now()) lockTxt += ' <button class="ghost" style="margin-left:8px" onclick="clearTradeLock()">解除锁定</button>';
-  html += '<div style="margin:2px 0 10px">交易锁定：' + lockTxt + '</div>';
+  var lockVal = lu > Date.now()
+    ? '<span class="tag bad">🔒 锁定中 · 剩 ' + fmtLockRemain(lu - Date.now()) + '</span> <span class="dim">至 ' + fmtTime(new Date(lu)) + '</span>'
+    : '<span class="tag ok">未锁定</span>';
+  lockVal += ' <span class="dim">配置时长 ' + (cfgH > 0 ? (cfgH + ' 小时（0 = 关闭）') : '已关闭') + '</span>';
+  html += '<div class="srow"><span class="sk">交易锁定</span><span class="sv">' + lockVal + '</span>' +
+    (lu > Date.now() ? '<span class="sact"><button class="ghost sm" onclick="clearTradeLock()">解除锁定</button></span>' : '') + '</div>';
   // 1.78.x: 登录密码状态（管理员永远看不到密码本身，只能清除）+ 活跃重置验证码/锁定
-  var pwTxt = d.hasPassword
-    ? '<span style="color:var(--ok)">已设置</span>'
-    : '<span class="dim">未设置（下次登录将要求设置新密码）</span>';
-  pwTxt += ' <button class="ghost" style="margin-left:8px" onclick="clearPlayerPassword()">清除密码</button>';
+  var pwVal = d.hasPassword
+    ? '<span class="tag ok">已设置</span>'
+    : '<span class="tag dim">未设置</span> <span class="dim">下次登录将要求设置新密码</span>';
+  var pwAct = '<button class="ghost sm" onclick="clearPlayerPassword()">清除密码</button>';
   if (d.reset && d.reset.code) {
-    pwTxt += ' <span class="dim">（活跃验证码：<b style="color:var(--orange-hi);letter-spacing:.2em">' + esc(d.reset.code) + '</b>，至 ' + fmtTime(new Date(Number(d.reset.expiresAt))) + '）</span>';
+    pwVal += ' <span class="tag warn">活跃验证码</span> <b class="code">' + esc(d.reset.code) + '</b>' +
+      ' <span class="dim">至 ' + fmtTime(new Date(Number(d.reset.expiresAt))) + '</span>';
+    pwAct = '<button class="ghost sm" onclick="copyText(\'' + esc(d.reset.code) + '\', this)">复制验证码</button>' + pwAct;
   }
   if (Number(d.resetLockedUntil) > Date.now()) {
-    pwTxt += ' <span style="color:var(--bad)">重置锁定中（至 ' + fmtTime(new Date(Number(d.resetLockedUntil))) + '）</span>';
+    pwVal += ' <span class="tag bad">重置锁定至 ' + fmtTime(new Date(Number(d.resetLockedUntil))) + '</span>';
   }
   // 1.78.x: 登录防暴力锁定（密码连续错误触发），管理员可提前解除
   if (Number(d.loginLockedUntil) > Date.now()) {
-    pwTxt += ' <span style="color:var(--bad)">登录锁定中（密码错误次数过多，至 ' + fmtTime(new Date(Number(d.loginLockedUntil))) + '）</span>';
-    pwTxt += ' <button class="ghost" style="margin-left:8px" onclick="clearPlayerLoginLock()">解除登录锁定</button>';
+    pwVal += ' <span class="tag bad">登录锁定 · 密码错误过多，至 ' + fmtTime(new Date(Number(d.loginLockedUntil))) + '</span>';
+    pwAct = '<button class="ghost sm" onclick="clearPlayerLoginLock()">解除登录锁定</button>' + pwAct;
   }
-  html += '<div style="margin:2px 0 10px">登录密码：' + pwTxt + '</div>';
-  if (!s) html += '<div class="dim">该玩家还没有主存档</div>';
-  else if (s.corrupt) html += '<div class="dim">主存档无法解析（可能损坏）</div>';
-  else {
+  html += '<div class="srow"><span class="sk">登录密码</span><span class="sv">' + pwVal + '</span><span class="sact">' + pwAct + '</span></div>';
+  html += '</div>';
+  // 3.0.3: 角色属性 + 装备并排双栏；无存档/存档损坏时只显示占位说明
+  if (!s) {
+    html += '<div class="panel"><div class="phead"><span class="ptitle">角色属性</span></div><div class="empty">该玩家还没有主存档</div></div>';
+  } else if (s.corrupt) {
+    html += '<div class="panel"><div class="phead"><span class="ptitle">角色属性</span></div><div class="empty">主存档无法解析（可能损坏）</div></div>';
+  } else {
     var eq = p.equip || {};
-    html += '<div class="panel"><table class="kv">' +
+    html += '<div class="grid2">';
+    html += '<div class="panel"><div class="phead"><span class="ptitle">角色属性</span></div><table class="kv">' +
       '<tr><td class="k">等级</td><td>' + (p.level != null ? p.level : '—') + '</td><td class="k">经验</td><td>' + (p.exp != null ? p.exp : '—') + '</td></tr>' +
       '<tr><td class="k">信用点</td><td>' + (p.credit != null ? p.credit : '—') + '</td><td class="k">HP</td><td>' + (p.hp != null ? p.hp : '—') + '</td></tr>' +
       '<tr><td class="k">SP 等级</td><td>' + (p.spLevel != null ? p.spLevel : '—') + '</td><td class="k">章节</td><td>' + (s.chapter != null ? s.chapter : '—') + '</td></tr>' +
       '<tr><td class="k">当前地图</td><td>' + esc(s.map || '—') + '</td><td class="k">游戏时长</td><td>' + fmtPlaytime(s.playtime) + '</td></tr>' +
       '</table></div>';
-    html += '<div class="panel"><b>装备</b><table class="kv" style="margin-top:6px">' +
-      eqRow(eq, '头部', 'head') + eqRow(eq, '左臂', 'leftArm') + eqRow(eq, '右臂', 'rightArm') + eqRow(eq, '躯干', 'torso') + eqRow(eq, '足部', 'feet') +
+    html += '<div class="panel"><div class="phead"><span class="ptitle">装备</span><span class="phint">悬停查看属性</span></div><table class="kv">' +
+      '<tr>' + eqRow(eq, '头部', 'head') + eqRow(eq, '左臂', 'leftArm') + '</tr>' +
+      '<tr>' + eqRow(eq, '右臂', 'rightArm') + eqRow(eq, '躯干', 'torso') + '</tr>' +
+      '<tr>' + eqRow(eq, '足部', 'feet') + '<td class="k"></td><td></td></tr>' +
       '</table></div>';
+    html += '</div>';
   }
-  html += '<div class="panel"><b>镜像存档（回档点，最新在前）</b><div style="margin-top:8px">';
+  // 3.0.3: 镜像存档 + 存档操作并排双栏
+  html += '<div class="grid2">';
+  html += '<div class="panel"><div class="phead"><span class="ptitle">镜像存档</span><span class="phint">回档点 · 最新在前</span></div><div class="mirrorList">';
   if (d.mirrors && d.mirrors.length) {
     html += d.mirrors.map(function(m){
       return '<div class="mirror"><span class="idx">#' + m.index + '</span><span>' + fmtTime(m.at) + '</span>' +
         '<span class="dim">' + (m.bytes / 1024).toFixed(1) + ' KB</span>' +
-        '<span style="flex:1"></span><button onclick="switchMirror(' + m.index + ')">切换到此镜像</button></div>';
+        '<span style="flex:1"></span><button class="ghost sm" onclick="switchMirror(' + m.index + ')">切换到此镜像</button></div>';
     }).join('');
-  } else html += '<div class="dim">暂无镜像</div>';
+  } else html += '<div class="empty">暂无镜像</div>';
   html += '</div></div>';
-  html += '<div class="panel"><b>存档操作</b><div class="row" style="margin-top:8px">' +
+  html += '<div class="panel"><div class="phead"><span class="ptitle">存档操作</span><span class="phint">仅涉及主存档，镜像不受影响</span></div>' +
+    '<div class="row">' +
     '<button class="ghost" onclick="exportSave()">⬇ 导出主存档</button>' +
     '<input type="file" id="importFile" accept=".json" style="display:none" onchange="importSave(this)">' +
-    '<button class="ghost" onclick="document.getElementById(\'importFile\').click()">⬆ 导入主存档</button>' +
-    '<span class="dim">导入/导出均只涉及主存档，镜像不受影响</span></div>' +
+    '<button class="ghost" onclick="document.getElementById(\'importFile\').click()">⬆ 导入主存档</button></div>' +
     '<div class="row"><input id="renameInput" placeholder="新玩家名" style="width:180px">' +
     '<button class="ghost" onclick="renamePlayer()">✏ 修改玩家名</button></div></div>';
-  html += '<div class="panel"><b>调试工具</b> <span class="dim">（需要玩家在线）</span>';
+  html += '</div>';
+  // 3.0.3: 危险操作独立为红色警示区块
+  html += '<div class="panel danger"><div class="phead"><span class="ptitle">危险操作</span><span class="phint">不可恢复</span></div><div class="row">' +
+    '<button class="danger" onclick="deletePlayer()">🗑 彻底删除账户</button>' +
+    '<span class="dim">删除账户、好友关系与全部存档（含镜像）；该玩家需重新注册</span></div></div>';
+  html += '<div class="panel"><div class="phead"><span class="ptitle">调试工具</span><span class="phint">需要玩家在线</span></div>';
   var godOn = !!godState[d.name];
-  html += '<div class="row" style="margin-top:8px"><input id="expAmt" type="number" placeholder="经验值" style="width:110px"><button onclick="give(\'giveExp\',\'expAmt\')">给予经验</button>' +
+  html += '<div class="row"><input id="expAmt" type="number" placeholder="经验值" style="width:110px"><button onclick="give(\'giveExp\',\'expAmt\')">给予经验</button>' +
     '<input id="creditAmt" type="number" placeholder="信用点" style="width:110px"><button onclick="give(\'giveCredits\',\'creditAmt\')">给予信用点</button>' +
     '<button id="godBtn" class="' + (godOn ? '' : 'ghost') + '" onclick="toggleGod()">' + (godOn ? '🛡 无敌模式：开' : '🛡 无敌模式：关') + '</button></div>';
   html += '<div class="row" style="position:relative"><input id="itemSearch" placeholder="搜索物品（模糊）…" style="width:220px" oninput="searchItems()" autocomplete="off">' +
@@ -611,6 +726,17 @@ async function clearPlayerLoginLock() {
   var j = await api('/player/' + encodeURIComponent(current) + '/clearLoginLock', { method: 'POST' });
   showMsg(j.ok, j.msg || (j.ok ? '登录锁定已解除' : '操作失败'));
   if (j.ok) loadDetail(encodeURIComponent(current));
+}
+// 0.2.6: 彻底删除账户（二次确认）。删除后玩家需重新注册；存档与好友关系一并清除。
+async function deletePlayer() {
+  if (!current) return;
+  if (!confirm('确定彻底删除账户「' + current + '」？\n\n此操作不可恢复：\n· 账户记录将被删除\n· 好友关系将被移除\n· 全部存档（含镜像）将被删除\n· 在线玩家会被强制断线\n\n该玩家下次需重新注册才能进入游戏。')) return;
+  var j = await api('/player/' + encodeURIComponent(current) + '/delete', { method: 'POST' });
+  showMsg(j.ok, j.msg || (j.ok ? '账户已删除' : '操作失败'));
+  if (j.ok) {
+    current = '';
+    try { await refreshAll(); } catch (e) {}
+  }
 }
 function exportSave() {
   window.open('/admin/api/player/' + encodeURIComponent(current) + '/export?token=' + encodeURIComponent(TOKEN));
@@ -721,6 +847,16 @@ document.addEventListener('keydown', function(ev){
     if (box) box.style.display = 'none';
   }
 });
+// 3.0.3: 搜索框回车 = 直接打开第一个匹配的玩家（少一次鼠标点击）
+(function () {
+  var inp = document.getElementById('playerSearch');
+  if (!inp) return;
+  inp.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'Enter') return;
+    var first = document.querySelector('#list .player');
+    if (first) first.click();
+  });
+})();
 
 // ---- 装备属性悬浮窗 ----
 var TYPE_LABEL = { EQUIP: '装备', CONS: '消耗品', TRADE: '交易素材' };
